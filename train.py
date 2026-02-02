@@ -828,6 +828,29 @@ def train(args):
 
 if __name__ == '__main__':
     args = parameter_parser()
+    # Select device (support --no-cuda and handle CUDA arch incompatibility gracefully)
+    # Note: PyTorch may report CUDA available even if the installed binary doesn't support the GPU arch (e.g., sm_86).
+    if getattr(args, "no_cuda", False):
+        args.device = torch.device("cpu")
+    else:
+        use_cuda = torch.cuda.is_available()
+        if use_cuda:
+            try:
+                major, minor = torch.cuda.get_device_capability()
+                arch = f"sm_{major}{minor}"
+                # torch.cuda.get_arch_list() exists on most builds; keep it defensive for older versions.
+                arch_list = getattr(torch.cuda, "get_arch_list", lambda: [])()
+                if arch_list and arch not in arch_list:
+                    print(
+                        f"[WARN] GPU arch {arch} is not supported by this PyTorch build ({arch_list}). "
+                        f"Falling back to CPU. (Tip: install a newer PyTorch build with CUDA support for {arch}.)"
+                    )
+                    use_cuda = False
+            except Exception as e:
+                # If anything goes wrong probing CUDA, stay safe and fall back to CPU.
+                print(f"[WARN] CUDA probing failed ({e}); falling back to CPU.")
+                use_cuda = False
+        args.device = torch.device("cuda") if use_cuda else torch.device("cpu")
     # The name of node features in NYC/graph_X.csv
     args.feature1 = 'checkin_cnt'
     args.feature2 = 'poi_catid'
