@@ -133,6 +133,29 @@ class FuseEmbeddings(nn.Module):
         return x
 
 
+class GraphPriorGate(nn.Module):
+    """
+    Personalized flow prior gate.
+    Given a user embedding, output a scalar alpha_u in (0,1) to scale the graph bias.
+    """
+
+    def __init__(self, user_embed_dim: int, hidden_dim: int = 64, dropout: float = 0.0):
+        super(GraphPriorGate, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(user_embed_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, user_embed):
+        # user_embed: (D,) or (B,D)
+        if user_embed.dim() == 1:
+            user_embed = user_embed.unsqueeze(0)
+        alpha = torch.sigmoid(self.net(user_embed))  # (B,1)
+        return alpha
+
+
 def t2v(tau, f, out_features, w, b, w0, b0, arg=None):
     if arg:
         v1 = f(torch.matmul(tau, w) + b, arg)

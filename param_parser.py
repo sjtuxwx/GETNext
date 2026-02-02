@@ -99,6 +99,20 @@ def parameter_parser():
                         default=128,
                         help='Node attn map hidden dimensions')
 
+    # ===================== Personalized Flow Prior =====================
+    parser.add_argument('--personalized-prior',
+                        action='store_true',
+                        default=False,
+                        help='Enable personalized flow prior: scale graph bias by a user-specific gate alpha_u')
+    parser.add_argument('--prior-gate-hidden',
+                        type=int,
+                        default=64,
+                        help='Hidden dim for the user gate MLP')
+    parser.add_argument('--prior-gate-dropout',
+                        type=float,
+                        default=0.0,
+                        help='Dropout for the user gate MLP')
+
     # ===================== Self-supervised / Contrastive learning (Graph perturbation) =====================
     parser.add_argument('--ssl',
                         action='store_true',

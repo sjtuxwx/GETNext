@@ -18,7 +18,8 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from dataloader import load_graph_adj_mtx, load_graph_node_features
-from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel
+from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel, \
+    GraphPriorGate
 from param_parser import parameter_parser
 from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_last_timestep, \
     mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss, edge_dropout_dense, feature_mask, info_nce_loss
@@ -235,6 +236,14 @@ def train(args):
     # %% Model2: User embedding model, nn.embedding
     num_users = len(user_id2idx_dict)
     user_embed_model = UserEmbeddings(num_users, args.user_embed_dim)
+    # Personalized flow prior gate (optional)
+    prior_gate_model = None
+    if getattr(args, "personalized_prior", False):
+        prior_gate_model = GraphPriorGate(
+            user_embed_dim=args.user_embed_dim,
+            hidden_dim=int(args.prior_gate_hidden),
+            dropout=float(args.prior_gate_dropout),
+        )
 
     # %% Model3: Time Model
     time_embed_model = Time2Vec('sin', out_dim=args.time_embed_dim)
@@ -257,14 +266,17 @@ def train(args):
                                  dropout=args.transformer_dropout)
 
     # Define overall loss and optimizer
-    optimizer = optim.Adam(params=list(poi_embed_model.parameters()) +
-                                  list(node_attn_model.parameters()) +
-                                  list(user_embed_model.parameters()) +
-                                  list(time_embed_model.parameters()) +
-                                  list(cat_embed_model.parameters()) +
-                                  list(embed_fuse_model1.parameters()) +
-                                  list(embed_fuse_model2.parameters()) +
-                                  list(seq_model.parameters()),
+    optim_params = list(poi_embed_model.parameters()) + \
+                   list(node_attn_model.parameters()) + \
+                   list(user_embed_model.parameters()) + \
+                   list(time_embed_model.parameters()) + \
+                   list(cat_embed_model.parameters()) + \
+                   list(embed_fuse_model1.parameters()) + \
+                   list(embed_fuse_model2.parameters()) + \
+                   list(seq_model.parameters())
+    if prior_gate_model is not None:
+        optim_params += list(prior_gate_model.parameters())
+    optimizer = optim.Adam(params=optim_params,
                            lr=args.lr,
                            weight_decay=args.weight_decay)
 
@@ -325,7 +337,10 @@ def train(args):
         for i in range(len(batch_seq_lens)):
             traj_i_input = batch_input_seqs[i]  # list of input check-in pois
             for j in range(len(traj_i_input)):
-                y_pred_poi_adjusted[i, j, :] = attn_map[traj_i_input[j], :] + y_pred_poi[i, j, :]
+                bias_row = attn_map[traj_i_input[j], :]
+                if (prior_gate_model is not None) and (batch_user_alpha is not None):
+                    bias_row = bias_row * batch_user_alpha[i]
+                y_pred_poi_adjusted[i, j, :] = bias_row + y_pred_poi[i, j, :]
 
         return y_pred_poi_adjusted
 
@@ -350,6 +365,8 @@ def train(args):
     embed_fuse_model1 = embed_fuse_model1.to(device=args.device)
     embed_fuse_model2 = embed_fuse_model2.to(device=args.device)
     seq_model = seq_model.to(device=args.device)
+    if prior_gate_model is not None:
+        prior_gate_model = prior_gate_model.to(device=args.device)
 
     # %% Loop epoch
     # For plotting
@@ -413,6 +430,7 @@ def train(args):
             batch_seq_labels_poi = []
             batch_seq_labels_time = []
             batch_seq_labels_cat = []
+            batch_user_alpha = None  # scalar gate per sample (optional)
 
             # POI embeddings for the main task
             poi_embeddings = poi_embed_model(X, A)
@@ -430,6 +448,7 @@ def train(args):
                 ssl_loss = info_nce_loss(z1[idx], z2[idx], temperature=float(args.ssl_temp))
 
             # Convert input seq to embeddings
+            batch_user_embeds = []
             for sample in batch:
                 # sample[0]: traj_id, sample[1]: input_seq, sample[2]: label_seq
                 traj_id = sample[0]
@@ -438,6 +457,15 @@ def train(args):
                 input_seq_time = [each[1] for each in sample[1]]
                 label_seq_time = [each[1] for each in sample[2]]
                 label_seq_cats = [poi_idx2cat_idx_dict[each] for each in label_seq]
+                # Cache user embedding for personalized prior gate (and reuse it for embeddings)
+                user_id = traj_id.split('_')[0]
+                user_idx = user_id2idx_dict[user_id]
+                user_input = torch.LongTensor([user_idx]).to(device=args.device)
+                user_embedding = torch.squeeze(user_embed_model(user_input))
+                batch_user_embeds.append(user_embedding)
+
+                # Build sequence embeddings (input_traj_to_embeddings recomputes user embedding internally,
+                # but we keep changes minimal; correctness remains.)
                 input_seq_embed = torch.stack(input_traj_to_embeddings(sample, poi_embeddings))
                 batch_seq_embeds.append(input_seq_embed)
                 batch_seq_lens.append(len(input_seq))
@@ -445,6 +473,9 @@ def train(args):
                 batch_seq_labels_poi.append(torch.LongTensor(label_seq))
                 batch_seq_labels_time.append(torch.FloatTensor(label_seq_time))
                 batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
+
+            if prior_gate_model is not None:
+                batch_user_alpha = prior_gate_model(torch.stack(batch_user_embeds)).squeeze(-1)  # (B,)
 
             # Pad seqs for batch training
             batch_padded = pad_sequence(batch_seq_embeds, batch_first=True, padding_value=-1)
@@ -563,10 +594,12 @@ def train(args):
             batch_seq_labels_poi = []
             batch_seq_labels_time = []
             batch_seq_labels_cat = []
+            batch_user_alpha = None  # scalar gate per sample (optional)
 
             poi_embeddings = poi_embed_model(X, A)
 
             # Convert input seq to embeddings
+            batch_user_embeds = []
             for sample in batch:
                 traj_id = sample[0]
                 input_seq = [each[0] for each in sample[1]]
@@ -574,6 +607,12 @@ def train(args):
                 input_seq_time = [each[1] for each in sample[1]]
                 label_seq_time = [each[1] for each in sample[2]]
                 label_seq_cats = [poi_idx2cat_idx_dict[each] for each in label_seq]
+                # Cache user embedding for personalized prior gate
+                user_id = traj_id.split('_')[0]
+                user_idx = user_id2idx_dict[user_id]
+                user_input = torch.LongTensor([user_idx]).to(device=args.device)
+                user_embedding = torch.squeeze(user_embed_model(user_input))
+                batch_user_embeds.append(user_embedding)
                 input_seq_embed = torch.stack(input_traj_to_embeddings(sample, poi_embeddings))
                 batch_seq_embeds.append(input_seq_embed)
                 batch_seq_lens.append(len(input_seq))
@@ -581,6 +620,9 @@ def train(args):
                 batch_seq_labels_poi.append(torch.LongTensor(label_seq))
                 batch_seq_labels_time.append(torch.FloatTensor(label_seq_time))
                 batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
+
+            if prior_gate_model is not None:
+                batch_user_alpha = prior_gate_model(torch.stack(batch_user_embeds)).squeeze(-1)  # (B,)
 
             # Pad seqs for batch training
             batch_padded = pad_sequence(batch_seq_embeds, batch_first=True, padding_value=-1)
