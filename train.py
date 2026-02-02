@@ -21,7 +21,7 @@ from dataloader import load_graph_adj_mtx, load_graph_node_features
 from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel
 from param_parser import parameter_parser
 from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_last_timestep, \
-    mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss
+    mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss, edge_dropout_dense, feature_mask, info_nce_loss
 
 
 def train(args):
@@ -221,6 +221,7 @@ def train(args):
         A = torch.from_numpy(A)
     X = X.to(device=args.device, dtype=torch.float)
     A = A.to(device=args.device, dtype=torch.float)
+    raw_A_for_ssl = raw_A  # keep raw adjacency on CPU for optional SSL graph augmentations
 
     args.gcn_nfeat = X.shape[1]
     poi_embed_model = GCN(ninput=args.gcn_nfeat,
@@ -328,6 +329,18 @@ def train(args):
 
         return y_pred_poi_adjusted
 
+    def build_ssl_adjs(epoch_seed: int):
+        """Build two augmented normalized adjacency matrices (torch tensors on args.device)."""
+        rng1 = np.random.RandomState(epoch_seed + 17)
+        rng2 = np.random.RandomState(epoch_seed + 23)
+        raw_A1 = edge_dropout_dense(raw_A_for_ssl, drop_prob=args.ssl_edge_drop, keep_self_loops=True, rng=rng1)
+        raw_A2 = edge_dropout_dense(raw_A_for_ssl, drop_prob=args.ssl_edge_drop, keep_self_loops=True, rng=rng2)
+        A1 = calculate_laplacian_matrix(raw_A1, mat_type='hat_rw_normd_lap_mat')
+        A2 = calculate_laplacian_matrix(raw_A2, mat_type='hat_rw_normd_lap_mat')
+        A1 = torch.from_numpy(np.asarray(A1)).to(device=args.device, dtype=torch.float)
+        A2 = torch.from_numpy(np.asarray(A2)).to(device=args.device, dtype=torch.float)
+        return A1, A2
+
     # %% ====================== Train ======================
     poi_embed_model = poi_embed_model.to(device=args.device)
     node_attn_model = node_attn_model.to(device=args.device)
@@ -385,6 +398,9 @@ def train(args):
         train_batches_time_loss_list = []
         train_batches_cat_loss_list = []
         src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
+        # Build two augmented graph views per epoch for contrastive learning (optional)
+        if getattr(args, "ssl", False):
+            A_ssl_1, A_ssl_2 = build_ssl_adjs(epoch_seed=epoch + int(args.seed))
         # Loop batch
         for b_idx, batch in enumerate(train_loader):
             if len(batch) != args.batch:
@@ -398,7 +414,20 @@ def train(args):
             batch_seq_labels_time = []
             batch_seq_labels_cat = []
 
+            # POI embeddings for the main task
             poi_embeddings = poi_embed_model(X, A)
+
+            # Optional: contrastive learning on POI embeddings under graph/feature perturbations
+            ssl_loss = None
+            if getattr(args, "ssl", False) and args.ssl_weight > 0:
+                X1 = feature_mask(X, mask_prob=args.ssl_feat_mask, inplace=False)
+                X2 = feature_mask(X, mask_prob=args.ssl_feat_mask, inplace=False)
+                z1 = poi_embed_model(X1, A_ssl_1)
+                z2 = poi_embed_model(X2, A_ssl_2)
+                # Sample a subset of nodes for InfoNCE (avoid O(N^2) on all POIs)
+                b_nodes = min(int(args.ssl_batch_nodes), int(z1.shape[0]))
+                idx = torch.randint(low=0, high=z1.shape[0], size=(b_nodes,), device=args.device)
+                ssl_loss = info_nce_loss(z1[idx], z2[idx], temperature=float(args.ssl_temp))
 
             # Convert input seq to embeddings
             for sample in batch:
@@ -439,6 +468,8 @@ def train(args):
 
             # Final loss
             loss = loss_poi + loss_time * args.time_loss_weight + loss_cat
+            if ssl_loss is not None:
+                loss = loss + args.ssl_weight * ssl_loss
             optimizer.zero_grad()
             loss.backward(retain_graph=True)
             optimizer.step()

@@ -99,6 +99,32 @@ def parameter_parser():
                         default=128,
                         help='Node attn map hidden dimensions')
 
+    # ===================== Self-supervised / Contrastive learning (Graph perturbation) =====================
+    parser.add_argument('--ssl',
+                        action='store_true',
+                        default=False,
+                        help='Enable graph perturbation + contrastive learning on POI embeddings (GCN)')
+    parser.add_argument('--ssl-weight',
+                        type=float,
+                        default=0.1,
+                        help='Weight of contrastive loss term')
+    parser.add_argument('--ssl-edge-drop',
+                        type=float,
+                        default=0.1,
+                        help='Edge dropout rate for augmented graph views (applied on raw adjacency)')
+    parser.add_argument('--ssl-feat-mask',
+                        type=float,
+                        default=0.1,
+                        help='Node feature masking rate for augmented views (applied on X)')
+    parser.add_argument('--ssl-temp',
+                        type=float,
+                        default=0.2,
+                        help='Temperature for InfoNCE loss')
+    parser.add_argument('--ssl-batch-nodes',
+                        type=int,
+                        default=1024,
+                        help='Number of POI nodes sampled per iteration to compute contrastive loss')
+
     # Training hyper-parameters
     parser.add_argument('--batch',
                         type=int,

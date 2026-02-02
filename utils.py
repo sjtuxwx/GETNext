@@ -170,3 +170,56 @@ def MRR_metric_last_timestep(y_true_seq, y_pred_seq):
 def array_round(x, k=4):
     # For a list of float values, keep k decimals of each element
     return list(np.around(np.array(x), k))
+
+
+# ===================== Graph perturbation & contrastive learning helpers =====================
+def edge_dropout_dense(adj_mat: np.ndarray, drop_prob: float, keep_self_loops: bool = True,
+                       rng: np.random.RandomState = None) -> np.ndarray:
+    """
+    Dense adjacency edge dropout for graph augmentation.
+    - adj_mat: dense (N,N), non-negative weights
+    - drop_prob: drop probability for existing edges (adj_mat > 0)
+    Returns a new dense adjacency with a subset of edges dropped.
+    """
+    if drop_prob <= 0:
+        return adj_mat
+    if rng is None:
+        rng = np.random.RandomState()
+
+    A = adj_mat.copy()
+    mask = A > 0
+    if keep_self_loops:
+        np.fill_diagonal(mask, False)  # never drop diagonal
+
+    # Sample which existing edges to drop
+    drop = rng.rand(*A.shape) < drop_prob
+    drop = drop & mask
+    A[drop] = 0.0
+    return A
+
+
+def feature_mask(x: torch.Tensor, mask_prob: float, inplace: bool = False) -> torch.Tensor:
+    """
+    Feature masking augmentation: randomly zero-out features.
+    x: (N,F) float tensor
+    """
+    if mask_prob <= 0:
+        return x
+    if not inplace:
+        x = x.clone()
+    keep = (torch.rand_like(x) >= mask_prob).to(dtype=x.dtype)
+    return x * keep
+
+
+def info_nce_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
+    """
+    Symmetric InfoNCE for aligned samples:
+    z1, z2: (B, D) embeddings for the same B nodes under two augmentations.
+    """
+    z1 = torch.nn.functional.normalize(z1, dim=1)
+    z2 = torch.nn.functional.normalize(z2, dim=1)
+    logits = (z1 @ z2.t()) / temperature  # (B,B)
+    labels = torch.arange(logits.size(0), device=logits.device)
+    loss_12 = torch.nn.functional.cross_entropy(logits, labels)
+    loss_21 = torch.nn.functional.cross_entropy(logits.t(), labels)
+    return 0.5 * (loss_12 + loss_21)
