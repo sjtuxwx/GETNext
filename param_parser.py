@@ -113,6 +113,20 @@ def parameter_parser():
                         default=0.0,
                         help='Dropout for the user gate MLP')
 
+    # ===================== Dual Attention Transformer (Short-term vs Long-term) =====================
+    parser.add_argument('--dual-attn',
+                        action='store_true',
+                        default=False,
+                        help='Enable dual attention Transformer: global causal attention + local window causal attention')
+    parser.add_argument('--local-window',
+                        type=int,
+                        default=16,
+                        help='Local attention window size (K): each timestep attends to the previous K steps (causal)')
+    parser.add_argument('--dual-fuse-dropout',
+                        type=float,
+                        default=0.0,
+                        help='Dropout used in dual-branch fusion gate')
+
     # ===================== Self-supervised / Contrastive learning (Graph perturbation) =====================
     parser.add_argument('--ssl',
                         action='store_true',

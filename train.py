@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 from dataloader import load_graph_adj_mtx, load_graph_node_features
 from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel, \
-    GraphPriorGate
+    DualTransformerModel, GraphPriorGate
 from param_parser import parameter_parser
 from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_last_timestep, \
     mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss, edge_dropout_dense, feature_mask, info_nce_loss
@@ -257,13 +257,24 @@ def train(args):
 
     # %% Model6: Sequence model
     args.seq_input_embed = args.poi_embed_dim + args.user_embed_dim + args.time_embed_dim + args.cat_embed_dim
-    seq_model = TransformerModel(num_pois,
-                                 num_cats,
-                                 args.seq_input_embed,
-                                 args.transformer_nhead,
-                                 args.transformer_nhid,
-                                 args.transformer_nlayers,
-                                 dropout=args.transformer_dropout)
+    if getattr(args, "dual_attn", False):
+        seq_model = DualTransformerModel(num_pois,
+                                         num_cats,
+                                         args.seq_input_embed,
+                                         args.transformer_nhead,
+                                         args.transformer_nhid,
+                                         args.transformer_nlayers,
+                                         local_window=int(args.local_window),
+                                         dropout=args.transformer_dropout,
+                                         fuse_dropout=float(args.dual_fuse_dropout))
+    else:
+        seq_model = TransformerModel(num_pois,
+                                     num_cats,
+                                     args.seq_input_embed,
+                                     args.transformer_nhead,
+                                     args.transformer_nhid,
+                                     args.transformer_nlayers,
+                                     dropout=args.transformer_dropout)
 
     # Define overall loss and optimizer
     optim_params = list(poi_embed_model.parameters()) + \
@@ -414,14 +425,15 @@ def train(args):
         train_batches_poi_loss_list = []
         train_batches_time_loss_list = []
         train_batches_cat_loss_list = []
-        src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
+        # NOTE: Transformer attention mask should be built by sequence length (not batch size).
+        # We'll build per-batch below based on padded sequence length.
+        src_mask = None
         # Build two augmented graph views per epoch for contrastive learning (optional)
         if getattr(args, "ssl", False):
             A_ssl_1, A_ssl_2 = build_ssl_adjs(epoch_seed=epoch + int(args.seed))
         # Loop batch
         for b_idx, batch in enumerate(train_loader):
-            if len(batch) != args.batch:
-                src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(args.device)
+            # mask will be created after padding (depends on seq_len)
 
             # For padding
             batch_input_seqs = []
@@ -485,6 +497,11 @@ def train(args):
 
             # Feedforward
             x = batch_padded.to(device=args.device, dtype=torch.float)
+            # Build causal mask by sequence length for the baseline TransformerModel only.
+            # DualTransformerModel computes its own global/local masks internally.
+            if (not getattr(args, "dual_attn", False)) and hasattr(seq_model, "generate_square_subsequent_mask"):
+                seq_len = x.shape[1]
+                src_mask = seq_model.generate_square_subsequent_mask(seq_len).to(args.device)
             y_poi = label_padded_poi.to(device=args.device, dtype=torch.long)
             y_time = label_padded_time.to(device=args.device, dtype=torch.float)
             y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
@@ -582,10 +599,9 @@ def train(args):
         val_batches_poi_loss_list = []
         val_batches_time_loss_list = []
         val_batches_cat_loss_list = []
-        src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
+        src_mask = None
         for vb_idx, batch in enumerate(val_loader):
-            if len(batch) != args.batch:
-                src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(args.device)
+            # mask will be created after padding (depends on seq_len)
 
             # For padding
             batch_input_seqs = []
@@ -632,6 +648,9 @@ def train(args):
 
             # Feedforward
             x = batch_padded.to(device=args.device, dtype=torch.float)
+            if (not getattr(args, "dual_attn", False)) and hasattr(seq_model, "generate_square_subsequent_mask"):
+                seq_len = x.shape[1]
+                src_mask = seq_model.generate_square_subsequent_mask(seq_len).to(args.device)
             y_poi = label_padded_poi.to(device=args.device, dtype=torch.long)
             y_time = label_padded_time.to(device=args.device, dtype=torch.float)
             y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)

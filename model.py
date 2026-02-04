@@ -224,6 +224,28 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+def _generate_causal_mask(sz: int, device=None):
+    """
+    Standard causal mask (bool): True means "masked / not allowed".
+    """
+    return torch.triu(torch.ones(sz, sz, device=device, dtype=torch.bool), diagonal=1)
+
+
+def _generate_local_causal_mask(sz: int, window: int, device=None):
+    """
+    Local causal mask: position i can attend to j if (j <= i) and (i - j <= window-1).
+    window=1 means only self.
+    """
+    if window <= 0:
+        return _generate_causal_mask(sz, device=device)
+    idx = torch.arange(sz, device=device)
+    i = idx.unsqueeze(1)  # (sz,1)
+    j = idx.unsqueeze(0)  # (1,sz)
+    allowed = (j <= i) & ((i - j) <= (window - 1))
+    # bool mask: True means masked
+    return ~allowed
+
+
 class TransformerModel(nn.Module):
     def __init__(self, num_poi, num_cat, embed_size, nhead, nhid, nlayers, dropout=0.5):
         super(TransformerModel, self).__init__()
@@ -256,4 +278,110 @@ class TransformerModel(nn.Module):
         out_poi = self.decoder_poi(x)
         out_time = self.decoder_time(x)
         out_cat = self.decoder_cat(x)
+        return out_poi, out_time, out_cat
+
+
+class DualTransformerModel(nn.Module):
+    """
+    Dual attention Transformer:
+    - Global branch: standard causal self-attention over full history.
+    - Local branch: causal self-attention restricted to a sliding window.
+    Outputs are fused with a learnable gate (token-wise scalar).
+    """
+
+    def __init__(self, num_poi, num_cat, embed_size, nhead, nhid, nlayers,
+                 local_window: int = 16, dropout: float = 0.5, fuse_dropout: float = 0.0):
+        super(DualTransformerModel, self).__init__()
+        from torch.nn import TransformerEncoder, TransformerEncoderLayer
+        self.model_type = 'DualTransformer'
+        self.embed_size = embed_size
+        self.local_window = int(local_window)
+
+        # Prefer batch_first when supported; otherwise transpose in forward.
+        try:
+            encoder_layers_g = TransformerEncoderLayer(embed_size, nhead, nhid, dropout, batch_first=True)
+            encoder_layers_l = TransformerEncoderLayer(embed_size, nhead, nhid, dropout, batch_first=True)
+            self.batch_first = True
+        except TypeError:
+            encoder_layers_g = TransformerEncoderLayer(embed_size, nhead, nhid, dropout)
+            encoder_layers_l = TransformerEncoderLayer(embed_size, nhead, nhid, dropout)
+            self.batch_first = False
+
+        self.pos_encoder = PositionalEncoding(embed_size, dropout)
+        self.global_encoder = TransformerEncoder(encoder_layers_g, nlayers)
+        self.local_encoder = TransformerEncoder(encoder_layers_l, nlayers)
+
+        self.fuse_gate = nn.Sequential(
+            nn.Linear(embed_size * 2, embed_size),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=fuse_dropout),
+            nn.Linear(embed_size, 1),
+        )
+
+        self.decoder_poi = nn.Linear(embed_size, num_poi)
+        self.decoder_time = nn.Linear(embed_size, 1)
+        self.decoder_cat = nn.Linear(embed_size, num_cat)
+        self.init_weights()
+
+    def init_weights(self):
+        initrange = 0.1
+        self.decoder_poi.bias.data.zero_()
+        self.decoder_poi.weight.data.uniform_(-initrange, initrange)
+
+    def _make_padding_mask(self, src):
+        # pad_sequence uses padding_value=-1 for embeddings in this repo
+        if self.batch_first:
+            return torch.all(src == -1, dim=-1)  # (B,S)
+        return torch.all(src == -1, dim=-1).transpose(0, 1)  # (B,S)
+
+    def forward(self, src, src_mask=None):
+        if self.batch_first:
+            # src: (B,S,E)
+            device = src.device
+            B, S, _ = src.shape
+            key_padding_mask = self._make_padding_mask(src)  # (B,S)
+
+            # PositionalEncoding here is written for (S,B,E); apply via transpose.
+            src = src.transpose(0, 1)  # (S,B,E)
+            src = src * math.sqrt(self.embed_size)
+            src = self.pos_encoder(src)
+            src = src.transpose(0, 1)  # (B,S,E)
+
+            # Use bool masks to match src_key_padding_mask dtype and avoid numerical issues.
+            g_mask = _generate_causal_mask(S, device=device)
+            l_mask = _generate_local_causal_mask(S, self.local_window, device=device)
+
+            h_g = self.global_encoder(src, mask=g_mask, src_key_padding_mask=key_padding_mask)
+            h_l = self.local_encoder(src, mask=l_mask, src_key_padding_mask=key_padding_mask)
+
+            gate_in = torch.cat([h_g, h_l], dim=-1)
+            gate = torch.sigmoid(self.fuse_gate(gate_in))  # (B,S,1)
+            h = gate * h_g + (1.0 - gate) * h_l
+
+            out_poi = self.decoder_poi(h)
+            out_time = self.decoder_time(h)
+            out_cat = self.decoder_cat(h)
+            return out_poi, out_time, out_cat
+
+        # src: (S,B,E)
+        device = src.device
+        S, B, _ = src.shape
+        key_padding_mask = self._make_padding_mask(src)  # (B,S)
+
+        src = src * math.sqrt(self.embed_size)
+        src = self.pos_encoder(src)
+
+        g_mask = _generate_causal_mask(S, device=device)
+        l_mask = _generate_local_causal_mask(S, self.local_window, device=device)
+
+        h_g = self.global_encoder(src, mask=g_mask, src_key_padding_mask=key_padding_mask)
+        h_l = self.local_encoder(src, mask=l_mask, src_key_padding_mask=key_padding_mask)
+
+        gate_in = torch.cat([h_g, h_l], dim=-1)
+        gate = torch.sigmoid(self.fuse_gate(gate_in))  # (S,B,1)
+        h = gate * h_g + (1.0 - gate) * h_l
+
+        out_poi = self.decoder_poi(h)
+        out_time = self.decoder_time(h)
+        out_cat = self.decoder_cat(h)
         return out_poi, out_time, out_cat
