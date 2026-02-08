@@ -327,6 +327,10 @@ class DualTransformerModel(nn.Module):
         initrange = 0.1
         self.decoder_poi.bias.data.zero_()
         self.decoder_poi.weight.data.uniform_(-initrange, initrange)
+        self.decoder_time.bias.data.zero_()
+        self.decoder_time.weight.data.uniform_(-initrange, initrange)
+        self.decoder_cat.bias.data.zero_()
+        self.decoder_cat.weight.data.uniform_(-initrange, initrange)
 
     def _make_padding_mask(self, src):
         # pad_sequence uses padding_value=-1 for embeddings in this repo
