@@ -98,6 +98,40 @@ def parameter_parser():
                         type=int,
                         default=128,
                         help='Node attn map hidden dimensions')
+    
+    # Disentangled Dual-Tower Model hyper-parameters
+    parser.add_argument('--use-disentangled-model',
+                        action='store_true',
+                        default=False,
+                        help='Use disentangled dual-tower model')
+    parser.add_argument('--dual-tower-hidden-dim',
+                        type=int,
+                        default=256,
+                        help='Hidden dimension for dual-tower model')
+    parser.add_argument('--num-fourier-freq',
+                        type=int,
+                        default=10,
+                        help='Number of frequencies for Fourier features')
+    parser.add_argument('--num-pref-heads',
+                        type=int,
+                        default=4,
+                        help='Number of attention heads in preference tower')
+    parser.add_argument('--num-pref-layers',
+                        type=int,
+                        default=2,
+                        help='Number of layers in preference tower')
+    parser.add_argument('--num-spatial-layers',
+                        type=int,
+                        default=2,
+                        help='Number of layers in spatial tower')
+    parser.add_argument('--initial-sigma',
+                        type=float,
+                        default=1.0,
+                        help='Initial value of spatial receptive field sigma')
+    parser.add_argument('--ortho-loss-weight',
+                        type=float,
+                        default=0.01,
+                        help='Weight for orthogonality constraint loss (lambda)')
 
     # Training hyper-parameters
     parser.add_argument('--batch',
