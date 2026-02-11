@@ -16,4 +16,4 @@ __pycache__/
 *.pkl.tar.gz
 *.pkl.tar.bz2
 *.pkl.tar.xz
-._NYC
+._NYC.cursor/debug.log
