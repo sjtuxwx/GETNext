@@ -24,6 +24,20 @@ from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_
     mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss
 
 
+def load_balancing_loss(gate_weights):
+    """
+    负载均衡损失：鼓励所有专家被均衡使用
+    gate_weights: [batch, seq_len, num_experts]
+    """
+    # 计算每个专家的平均使用率
+    expert_usage = gate_weights.mean(dim=[0, 1])  # [num_experts]
+    # 理想情况：每个专家使用率相等
+    target_usage = 1.0 / gate_weights.size(-1)
+    # L2损失
+    loss = ((expert_usage - target_usage) ** 2).sum()
+    return loss
+
+
 def train(args):
     args.save_dir = increment_path(Path(args.project) / args.name, exist_ok=args.exist_ok, sep='-')
     if not os.path.exists(args.save_dir): os.makedirs(args.save_dir)
@@ -267,8 +281,8 @@ def train(args):
                            lr=args.lr,
                            weight_decay=args.weight_decay)
 
-    criterion_poi = nn.CrossEntropyLoss(ignore_index=-1)  # -1 is padding
-    criterion_cat = nn.CrossEntropyLoss(ignore_index=-1)  # -1 is padding
+    criterion_poi = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=0.1)  # -1 is padding, label smoothing for diversity
+    criterion_cat = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=0.1)  # -1 is padding, label smoothing for diversity
     criterion_time = maksed_mse_loss
 
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -400,6 +414,10 @@ def train(args):
 
             poi_embeddings = poi_embed_model(X, A)
 
+            # Prepare for MoE gate inputs
+            batch_user_embeds = []
+            batch_time_embeds = []
+
             # Convert input seq to embeddings
             for sample in batch:
                 # sample[0]: traj_id, sample[1]: input_seq, sample[2]: label_seq
@@ -416,19 +434,72 @@ def train(args):
                 batch_seq_labels_poi.append(torch.LongTensor(label_seq))
                 batch_seq_labels_time.append(torch.FloatTensor(label_seq_time))
                 batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
+                
+                # Prepare user embedding for MoE gate
+                user_id = traj_id.split('_')[0]
+                user_idx = user_id2idx_dict[user_id]
+                user_embed = user_embed_model(torch.LongTensor([user_idx]).to(device=args.device))
+                batch_user_embeds.append(user_embed.squeeze(0))
+                
+                # Prepare time embeddings for MoE gate
+                time_embeds = []
+                for t in input_seq_time:
+                    t_embed = time_embed_model(torch.tensor([t], dtype=torch.float).to(device=args.device))
+                    time_embeds.append(t_embed.squeeze(0))
+                batch_time_embeds.append(torch.stack(time_embeds))
 
             # Pad seqs for batch training
             batch_padded = pad_sequence(batch_seq_embeds, batch_first=True, padding_value=-1)
             label_padded_poi = pad_sequence(batch_seq_labels_poi, batch_first=True, padding_value=-1)
             label_padded_time = pad_sequence(batch_seq_labels_time, batch_first=True, padding_value=-1)
             label_padded_cat = pad_sequence(batch_seq_labels_cat, batch_first=True, padding_value=-1)
+            
+            # Prepare MoE gate inputs
+            batch_user_embeds_tensor = torch.stack(batch_user_embeds)  # [batch, user_embed_dim]
+            batch_time_embeds_padded = pad_sequence(batch_time_embeds, batch_first=True, padding_value=0)  # [batch, seq_len, time_embed_dim]
 
             # Feedforward
             x = batch_padded.to(device=args.device, dtype=torch.float)
             y_poi = label_padded_poi.to(device=args.device, dtype=torch.long)
             y_time = label_padded_time.to(device=args.device, dtype=torch.float)
             y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
-            y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
+            y_pred_poi, y_pred_time, y_pred_cat, gate_weights_poi, gate_weights_cat = seq_model(
+                x, src_mask, batch_user_embeds_tensor, batch_time_embeds_padded
+            )
+
+            # #region agent log - 分析门控权重分布
+            if b_idx == 0:
+                import json
+                # 计算平均专家使用率 [num_experts]
+                avg_gate_weights_poi = gate_weights_poi.mean(dim=[0, 1]).detach().cpu().numpy()
+                avg_gate_weights_cat = gate_weights_cat.mean(dim=[0, 1]).detach().cpu().numpy()
+                # 计算专家使用的方差（衡量是否塌陷）
+                gate_variance_poi = gate_weights_poi.var(dim=-1).mean().item()
+                gate_variance_cat = gate_weights_cat.var(dim=-1).mean().item()
+                # 计算最大门控权重（如果某个专家权重>0.5说明可能塌陷）
+                max_gate_poi = gate_weights_poi.max(dim=-1)[0].mean().item()
+                max_gate_cat = gate_weights_cat.max(dim=-1)[0].mean().item()
+                
+                with open('/data/xwx/code/GETNext/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({
+                        "id": "log_gate_analysis",
+                        "timestamp": __import__('time').time()*1000,
+                        "location": "train.py:456",
+                        "message": "Gate weights analysis",
+                        "data": {
+                            "epoch": epoch,
+                            "batch_idx": b_idx,
+                            "avg_gate_weights_poi": avg_gate_weights_poi.tolist(),
+                            "avg_gate_weights_cat": avg_gate_weights_cat.tolist(),
+                            "gate_variance_poi": gate_variance_poi,
+                            "gate_variance_cat": gate_variance_cat,
+                            "max_gate_poi": max_gate_poi,
+                            "max_gate_cat": max_gate_cat,
+                            "ideal_weight": 1.0 / 8.0  # 理想情况每个专家0.125
+                        },
+                        "hypothesisId": "GATE_COLLAPSE"
+                    }) + '\n')
+            # #endregion
 
             # Graph Attention adjusted prob
             y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi)
@@ -436,9 +507,14 @@ def train(args):
             loss_poi = criterion_poi(y_pred_poi_adjusted.transpose(1, 2), y_poi)
             loss_time = criterion_time(torch.squeeze(y_pred_time), y_time)
             loss_cat = criterion_cat(y_pred_cat.transpose(1, 2), y_cat)
+            
+            # 负载均衡损失：鼓励专家均衡使用和多样化
+            lb_loss_poi = load_balancing_loss(gate_weights_poi)
+            lb_loss_cat = load_balancing_loss(gate_weights_cat)
+            lb_loss = lb_loss_poi + lb_loss_cat
 
             # Final loss
-            loss = loss_poi + loss_time * args.time_loss_weight + loss_cat
+            loss = loss_poi + loss_time * args.time_loss_weight + loss_cat + args.lb_loss_weight * lb_loss
             optimizer.zero_grad()
             loss.backward(retain_graph=True)
             optimizer.step()
@@ -454,6 +530,45 @@ def train(args):
             batch_pred_pois = y_pred_poi_adjusted.detach().cpu().numpy()
             batch_pred_times = y_pred_time.detach().cpu().numpy()
             batch_pred_cats = y_pred_cat.detach().cpu().numpy()
+            
+            # #region agent log - 分析预测POI的多样性
+            if b_idx == 0:
+                import json
+                # 获取top-1预测
+                top1_preds = np.argmax(batch_pred_pois, axis=-1)  # [batch, seq_len]
+                # 统计唯一POI数量
+                unique_pois = len(np.unique(top1_preds[top1_preds != -1]))  # 排除padding
+                total_pois = np.sum(batch_label_pois != -1)
+                # 统计最频繁的POI
+                valid_preds = top1_preds[top1_preds != -1].flatten()
+                if len(valid_preds) > 0:
+                    poi_counts = np.bincount(valid_preds)
+                    top5_frequent_pois = np.argsort(poi_counts)[-5:][::-1].tolist()
+                    top5_frequencies = [int(poi_counts[p]) for p in top5_frequent_pois]
+                else:
+                    top5_frequent_pois = []
+                    top5_frequencies = []
+                
+                with open('/data/xwx/code/GETNext/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({
+                        "id": "log_prediction_diversity",
+                        "timestamp": __import__('time').time()*1000,
+                        "location": "train.py:530",
+                        "message": "Prediction diversity analysis",
+                        "data": {
+                            "epoch": epoch,
+                            "batch_idx": b_idx,
+                            "unique_poi_count": int(unique_pois),
+                            "total_predictions": int(total_pois),
+                            "diversity_ratio": float(unique_pois / max(total_pois, 1)),
+                            "top5_frequent_pois": top5_frequent_pois,
+                            "top5_frequencies": top5_frequencies,
+                            "total_poi_vocab": 4981
+                        },
+                        "hypothesisId": "PREDICTION_DIVERSITY"
+                    }) + '\n')
+            # #endregion
+            
             for label_pois, pred_pois, seq_len in zip(batch_label_pois, batch_pred_pois, batch_seq_lens):
                 label_pois = label_pois[:seq_len]  # shape: (seq_len, )
                 pred_pois = pred_pois[:seq_len, :]  # shape: (seq_len, num_poi)
@@ -535,6 +650,10 @@ def train(args):
 
             poi_embeddings = poi_embed_model(X, A)
 
+            # Prepare for MoE gate inputs
+            batch_user_embeds = []
+            batch_time_embeds = []
+
             # Convert input seq to embeddings
             for sample in batch:
                 traj_id = sample[0]
@@ -550,19 +669,38 @@ def train(args):
                 batch_seq_labels_poi.append(torch.LongTensor(label_seq))
                 batch_seq_labels_time.append(torch.FloatTensor(label_seq_time))
                 batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
+                
+                # Prepare user embedding for MoE gate
+                user_id = traj_id.split('_')[0]
+                user_idx = user_id2idx_dict[user_id]
+                user_embed = user_embed_model(torch.LongTensor([user_idx]).to(device=args.device))
+                batch_user_embeds.append(user_embed.squeeze(0))
+                
+                # Prepare time embeddings for MoE gate
+                time_embeds = []
+                for t in input_seq_time:
+                    t_embed = time_embed_model(torch.tensor([t], dtype=torch.float).to(device=args.device))
+                    time_embeds.append(t_embed.squeeze(0))
+                batch_time_embeds.append(torch.stack(time_embeds))
 
             # Pad seqs for batch training
             batch_padded = pad_sequence(batch_seq_embeds, batch_first=True, padding_value=-1)
             label_padded_poi = pad_sequence(batch_seq_labels_poi, batch_first=True, padding_value=-1)
             label_padded_time = pad_sequence(batch_seq_labels_time, batch_first=True, padding_value=-1)
             label_padded_cat = pad_sequence(batch_seq_labels_cat, batch_first=True, padding_value=-1)
+            
+            # Prepare MoE gate inputs
+            batch_user_embeds_tensor = torch.stack(batch_user_embeds)  # [batch, user_embed_dim]
+            batch_time_embeds_padded = pad_sequence(batch_time_embeds, batch_first=True, padding_value=0)  # [batch, seq_len, time_embed_dim]
 
             # Feedforward
             x = batch_padded.to(device=args.device, dtype=torch.float)
             y_poi = label_padded_poi.to(device=args.device, dtype=torch.long)
             y_time = label_padded_time.to(device=args.device, dtype=torch.float)
             y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
-            y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
+            y_pred_poi, y_pred_time, y_pred_cat, gate_weights_poi, gate_weights_cat = seq_model(
+                x, src_mask, batch_user_embeds_tensor, batch_time_embeds_padded
+            )
 
             # Graph Attention adjusted prob
             y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi)

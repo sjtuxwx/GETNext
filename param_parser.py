@@ -98,6 +98,18 @@ def parameter_parser():
                         type=int,
                         default=128,
                         help='Node attn map hidden dimensions')
+    parser.add_argument('--moe-num-experts',
+                        type=int,
+                        default=8,
+                        help='Number of experts in MoE')
+    parser.add_argument('--use-moe',
+                        action='store_true',
+                        default=True,
+                        help='Whether to use MoE for POI and Cat decoders')
+    parser.add_argument('--lb-loss-weight',
+                        type=float,
+                        default=0.01,
+                        help='Weight for load balancing loss in MoE')
 
     # Training hyper-parameters
     parser.add_argument('--batch',

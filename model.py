@@ -201,6 +201,69 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class MixtureOfExpertsDecoder(nn.Module):
+    """基于时间段的混合专家解码器"""
+    def __init__(self, embed_size, output_size, num_experts=8, 
+                 user_embed_dim=128, time_embed_dim=32):
+        super(MixtureOfExpertsDecoder, self).__init__()
+        self.num_experts = num_experts
+        
+        # 8个专家网络（每个是一个线性层）
+        self.experts = nn.ModuleList([
+            nn.Linear(embed_size, output_size) 
+            for _ in range(num_experts)
+        ])
+        
+        # 门控网络：输入为 user_embed + time_embed + transformer_output
+        gate_input_dim = user_embed_dim + time_embed_dim + embed_size
+        self.gate = nn.Sequential(
+            nn.Linear(gate_input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, num_experts),
+            nn.Softmax(dim=-1)
+        )
+        
+    def forward(self, x, user_embed, time_embed):
+        """
+        Args:
+            x: Transformer输出 [batch, seq_len, embed_size]
+            user_embed: 用户embedding [batch, user_embed_dim]
+            time_embed: 时间embedding [batch, seq_len, time_embed_dim]
+        Returns:
+            output: 专家加权输出 [batch, seq_len, output_size]
+            gate_weights: 门控权重 [batch, seq_len, num_experts]
+        """
+        # 确保x是 [batch, seq_len, embed_size] 格式
+        if x.size(0) != user_embed.size(0):
+            # x is [seq_len, batch, embed_size], need to transpose
+            x = x.transpose(0, 1)
+        
+        batch_size, seq_len, embed_size = x.shape
+        
+        # 扩展user_embed到序列长度
+        user_embed_expanded = user_embed.unsqueeze(1).expand(-1, seq_len, -1)
+        
+        # 拼接门控输入
+        gate_input = torch.cat([x, user_embed_expanded, time_embed], dim=-1)
+        
+        # 计算门控权重
+        gate_weights = self.gate(gate_input)  # [batch, seq_len, num_experts]
+        
+        # 计算每个专家的输出
+        expert_outputs = []
+        for expert in self.experts:
+            expert_out = expert(x)  # [batch, seq_len, output_size]
+            expert_outputs.append(expert_out)
+        expert_outputs = torch.stack(expert_outputs, dim=-1)  # [batch, seq_len, output_size, num_experts]
+        
+        # 加权求和
+        gate_weights_expanded = gate_weights.unsqueeze(2)  # [batch, seq_len, 1, num_experts]
+        output = (expert_outputs * gate_weights_expanded).sum(dim=-1)  # [batch, seq_len, output_size]
+        
+        return output, gate_weights
+
+
 class TransformerModel(nn.Module):
     def __init__(self, num_poi, num_cat, embed_size, nhead, nhid, nlayers, dropout=0.5):
         super(TransformerModel, self).__init__()
@@ -211,9 +274,15 @@ class TransformerModel(nn.Module):
         self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
         # self.encoder = nn.Embedding(num_poi, embed_size)
         self.embed_size = embed_size
-        self.decoder_poi = nn.Linear(embed_size, num_poi)
-        self.decoder_time = nn.Linear(embed_size, 1)
-        self.decoder_cat = nn.Linear(embed_size, num_cat)
+        self.decoder_poi = MixtureOfExpertsDecoder(
+            embed_size, num_poi, num_experts=8,
+            user_embed_dim=128, time_embed_dim=32
+        )
+        self.decoder_time = nn.Linear(embed_size, 1)  # 保持独立
+        self.decoder_cat = MixtureOfExpertsDecoder(
+            embed_size, num_cat, num_experts=8,
+            user_embed_dim=128, time_embed_dim=32
+        )
         self.init_weights()
 
     def generate_square_subsequent_mask(self, sz):
@@ -223,14 +292,38 @@ class TransformerModel(nn.Module):
 
     def init_weights(self):
         initrange = 0.1
-        self.decoder_poi.bias.data.zero_()
-        self.decoder_poi.weight.data.uniform_(-initrange, initrange)
+        # 初始化MoE专家网络
+        for expert in self.decoder_poi.experts:
+            expert.bias.data.zero_()
+            expert.weight.data.uniform_(-initrange, initrange)
+        for expert in self.decoder_cat.experts:
+            expert.bias.data.zero_()
+            expert.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, src, src_mask):
+    def forward(self, src, src_mask, user_embed=None, time_embed=None):
+        """
+        Args:
+            src: 输入序列 [seq_len, batch, embed_size] 或 [batch, seq_len, embed_size]
+            src_mask: 注意力掩码
+            user_embed: 用户embedding [batch, user_embed_dim]
+            time_embed: 时间embedding [batch, seq_len, time_embed_dim]
+        """
         src = src * math.sqrt(self.embed_size)
         src = self.pos_encoder(src)
-        x = self.transformer_encoder(src, src_mask)
-        out_poi = self.decoder_poi(x)
-        out_time = self.decoder_time(x)
-        out_cat = self.decoder_cat(x)
-        return out_poi, out_time, out_cat
+        x = self.transformer_encoder(src, src_mask)  # [seq_len, batch, embed_size]
+        
+        # Transformer输出需要转置为 [batch, seq_len, embed_size] 用于decoder
+        x_transposed = x.transpose(0, 1)  # [batch, seq_len, embed_size]
+        
+        out_time = self.decoder_time(x)  # 保持原始格式用于时间预测
+        
+        if user_embed is not None and time_embed is not None:
+            # 使用MoE
+            out_poi, gate_weights_poi = self.decoder_poi(x_transposed, user_embed, time_embed)
+            out_cat, gate_weights_cat = self.decoder_cat(x_transposed, user_embed, time_embed)
+            return out_poi, out_time, out_cat, gate_weights_poi, gate_weights_cat
+        else:
+            # 降级为普通模式（用于兼容性）
+            out_poi = self.decoder_poi.experts[0](x_transposed)  # 使用第一个专家
+            out_cat = self.decoder_cat.experts[0](x_transposed)
+            return out_poi, out_time, out_cat, None, None
