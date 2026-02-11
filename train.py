@@ -18,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from dataloader import load_graph_adj_mtx, load_graph_node_features
-from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel
+from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel, TemporalRotaryTransformerModel
 from param_parser import parameter_parser
 from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_last_timestep, \
     mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss
@@ -243,17 +243,20 @@ def train(args):
 
     # %% Model5: Embedding fusion models
     embed_fuse_model1 = FuseEmbeddings(args.user_embed_dim, args.poi_embed_dim)
-    embed_fuse_model2 = FuseEmbeddings(args.time_embed_dim, args.cat_embed_dim)
+    # embed_fuse_model2 已移除 - 时间通过门控旋转注入,不再需要time+cat融合
 
     # %% Model6: Sequence model
-    args.seq_input_embed = args.poi_embed_dim + args.user_embed_dim + args.time_embed_dim + args.cat_embed_dim
-    seq_model = TransformerModel(num_pois,
-                                 num_cats,
-                                 args.seq_input_embed,
-                                 args.transformer_nhead,
-                                 args.transformer_nhid,
-                                 args.transformer_nlayers,
-                                 dropout=args.transformer_dropout)
+    # 维度计算: user+poi融合后256 + cat 32 = 288 (去掉原来的time 32拼接)
+    args.seq_input_embed = args.poi_embed_dim + args.user_embed_dim + args.cat_embed_dim
+    seq_model = TemporalRotaryTransformerModel(num_pois,
+                                               num_cats,
+                                               args.seq_input_embed,
+                                               args.transformer_nhead,
+                                               args.transformer_nhid,
+                                               args.transformer_nlayers,
+                                               args.time_embed_dim,
+                                               args.device,
+                                               dropout=args.transformer_dropout)
 
     # Define overall loss and optimizer
     optimizer = optim.Adam(params=list(poi_embed_model.parameters()) +
@@ -262,13 +265,14 @@ def train(args):
                                   list(time_embed_model.parameters()) +
                                   list(cat_embed_model.parameters()) +
                                   list(embed_fuse_model1.parameters()) +
-                                  list(embed_fuse_model2.parameters()) +
+                                  # list(embed_fuse_model2.parameters()) +  # 已移除
                                   list(seq_model.parameters()),
                            lr=args.lr,
                            weight_decay=args.weight_decay)
 
-    criterion_poi = nn.CrossEntropyLoss(ignore_index=-1)  # -1 is padding
-    criterion_cat = nn.CrossEntropyLoss(ignore_index=-1)  # -1 is padding
+    # Label smoothing 可以防止过拟合，让模型不那么自信
+    criterion_poi = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=0.05)  # -1 is padding，降低到0.05
+    criterion_cat = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=0.05)  # -1 is padding
     criterion_time = maksed_mse_loss
 
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -291,13 +295,17 @@ def train(args):
 
         # POI to embedding and fuse embeddings
         input_seq_embed = []
+        seq_times = []  # 新增: 收集时间值用于temporal rotary
+        
         for idx in range(len(input_seq)):
             poi_embedding = poi_embeddings[input_seq[idx]]
             poi_embedding = torch.squeeze(poi_embedding).to(device=args.device)
 
             # Time to vector
+            time_value = input_seq_time[idx]
+            seq_times.append(time_value)
             time_embedding = time_embed_model(
-                torch.tensor([input_seq_time[idx]], dtype=torch.float).to(device=args.device))
+                torch.tensor([time_value], dtype=torch.float).to(device=args.device))
             time_embedding = torch.squeeze(time_embedding).to(device=args.device)
 
             # Categroy to embedding
@@ -307,15 +315,17 @@ def train(args):
 
             # Fuse user+poi embeds
             fused_embedding1 = embed_fuse_model1(user_embedding, poi_embedding)
-            fused_embedding2 = embed_fuse_model2(time_embedding, cat_embedding)
-
-            # Concat time, cat after user+poi
-            concat_embedding = torch.cat((fused_embedding1, fused_embedding2), dim=-1)
+            
+            # **关键修改**: 不再拼接time,而是通过门控旋转注入
+            # 旧代码: fused_embedding2 = embed_fuse_model2(time_embedding, cat_embedding)
+            #        concat_embedding = torch.cat((fused_embedding1, fused_embedding2), dim=-1)
+            # 新代码: 只拼接cat,时间通过旋转注入
+            concat_embedding = torch.cat((fused_embedding1, cat_embedding), dim=-1)
 
             # Save final embed
             input_seq_embed.append(concat_embedding)
 
-        return input_seq_embed
+        return input_seq_embed, torch.tensor(seq_times, dtype=torch.float)
 
     def adjust_pred_prob_by_graph(y_pred_poi):
         y_pred_poi_adjusted = torch.zeros_like(y_pred_poi)
@@ -335,7 +345,7 @@ def train(args):
     time_embed_model = time_embed_model.to(device=args.device)
     cat_embed_model = cat_embed_model.to(device=args.device)
     embed_fuse_model1 = embed_fuse_model1.to(device=args.device)
-    embed_fuse_model2 = embed_fuse_model2.to(device=args.device)
+    # embed_fuse_model2 = embed_fuse_model2.to(device=args.device)  # 已移除
     seq_model = seq_model.to(device=args.device)
 
     # %% Loop epoch
@@ -362,6 +372,10 @@ def train(args):
     val_epochs_cat_loss_list = []
     # For saving ckpt
     max_val_score = -np.inf
+    # Early stopping
+    patience = 8  # 如果8个epoch验证集没有提升就停止（从5增加到8，给模型更多时间）
+    patience_counter = 0
+    best_epoch = 0
 
     for epoch in range(args.epochs):
         logging.info(f"{'*' * 50}Epoch:{epoch:03d}{'*' * 50}\n")
@@ -371,7 +385,7 @@ def train(args):
         time_embed_model.train()
         cat_embed_model.train()
         embed_fuse_model1.train()
-        embed_fuse_model2.train()
+        # embed_fuse_model2.train()  # 已移除
         seq_model.train()
 
         train_batches_top1_acc_list = []
@@ -384,11 +398,9 @@ def train(args):
         train_batches_poi_loss_list = []
         train_batches_time_loss_list = []
         train_batches_cat_loss_list = []
-        src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
+        src_mask = None  # Will be generated dynamically based on sequence length
         # Loop batch
         for b_idx, batch in enumerate(train_loader):
-            if len(batch) != args.batch:
-                src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(args.device)
 
             # For padding
             batch_input_seqs = []
@@ -397,6 +409,8 @@ def train(args):
             batch_seq_labels_poi = []
             batch_seq_labels_time = []
             batch_seq_labels_cat = []
+            batch_seq_times = []  # 新增: 收集每条轨迹的时间序列
+            batch_target_times = []  # 新增: 收集目标时间
 
             poi_embeddings = poi_embed_model(X, A)
 
@@ -409,26 +423,46 @@ def train(args):
                 input_seq_time = [each[1] for each in sample[1]]
                 label_seq_time = [each[1] for each in sample[2]]
                 label_seq_cats = [poi_idx2cat_idx_dict[each] for each in label_seq]
-                input_seq_embed = torch.stack(input_traj_to_embeddings(sample, poi_embeddings))
-                batch_seq_embeds.append(input_seq_embed)
+                
+                # 调用修改后的函数,返回embeddings和时间序列
+                input_seq_embed, seq_times = input_traj_to_embeddings(sample, poi_embeddings)
+                batch_seq_embeds.append(torch.stack(input_seq_embed))
+                batch_seq_times.append(seq_times)
                 batch_seq_lens.append(len(input_seq))
                 batch_input_seqs.append(input_seq)
                 batch_seq_labels_poi.append(torch.LongTensor(label_seq))
                 batch_seq_labels_time.append(torch.FloatTensor(label_seq_time))
                 batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
+                
+                # 构建目标时间(训练时=标签时间)
+                batch_target_times.append(torch.FloatTensor(label_seq_time))
 
             # Pad seqs for batch training
             batch_padded = pad_sequence(batch_seq_embeds, batch_first=True, padding_value=-1)
             label_padded_poi = pad_sequence(batch_seq_labels_poi, batch_first=True, padding_value=-1)
             label_padded_time = pad_sequence(batch_seq_labels_time, batch_first=True, padding_value=-1)
             label_padded_cat = pad_sequence(batch_seq_labels_cat, batch_first=True, padding_value=-1)
+            
+            # Pad时间序列
+            padded_seq_times = pad_sequence(batch_seq_times, batch_first=True, padding_value=0)
+            padded_target_times = pad_sequence(batch_target_times, batch_first=True, padding_value=0)
 
             # Feedforward
             x = batch_padded.to(device=args.device, dtype=torch.float)
+            # TemporalRotaryTransformerModel expects (seq_len, batch, d_model)
+            x = x.transpose(0, 1)  # (batch, seq_len, d_model) -> (seq_len, batch, d_model)
+            
+            # Generate mask based on actual sequence length
+            seq_len = x.size(0)
+            src_mask = seq_model.generate_square_subsequent_mask(seq_len).to(args.device)
+            
             y_poi = label_padded_poi.to(device=args.device, dtype=torch.long)
             y_time = label_padded_time.to(device=args.device, dtype=torch.float)
             y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
-            y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
+            seq_times = padded_seq_times.to(device=args.device)
+            target_times = padded_target_times.to(device=args.device)
+            
+            y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask, seq_times, target_times)
 
             # Graph Attention adjusted prob
             y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi)
@@ -441,6 +475,19 @@ def train(args):
             loss = loss_poi + loss_time * args.time_loss_weight + loss_cat
             optimizer.zero_grad()
             loss.backward(retain_graph=True)
+            
+            # 梯度裁剪，防止梯度爆炸导致的过拟合
+            torch.nn.utils.clip_grad_norm_(
+                list(poi_embed_model.parameters()) +
+                list(node_attn_model.parameters()) +
+                list(user_embed_model.parameters()) +
+                list(time_embed_model.parameters()) +
+                list(cat_embed_model.parameters()) +
+                list(embed_fuse_model1.parameters()) +
+                list(seq_model.parameters()),
+                max_norm=2.0  # 梯度最大范数（从1.0放松到2.0）
+            )
+            
             optimizer.step()
 
             # Performance measurement
@@ -508,7 +555,7 @@ def train(args):
         time_embed_model.eval()
         cat_embed_model.eval()
         embed_fuse_model1.eval()
-        embed_fuse_model2.eval()
+        # embed_fuse_model2.eval()  # 已移除
         seq_model.eval()
         val_batches_top1_acc_list = []
         val_batches_top5_acc_list = []
@@ -520,10 +567,8 @@ def train(args):
         val_batches_poi_loss_list = []
         val_batches_time_loss_list = []
         val_batches_cat_loss_list = []
-        src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
+        src_mask = None  # Will be generated dynamically based on sequence length
         for vb_idx, batch in enumerate(val_loader):
-            if len(batch) != args.batch:
-                src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(args.device)
 
             # For padding
             batch_input_seqs = []
@@ -532,6 +577,8 @@ def train(args):
             batch_seq_labels_poi = []
             batch_seq_labels_time = []
             batch_seq_labels_cat = []
+            batch_seq_times = []  # 新增: 收集每条轨迹的时间序列
+            batch_target_times = []  # 新增: 收集目标时间
 
             poi_embeddings = poi_embed_model(X, A)
 
@@ -543,26 +590,46 @@ def train(args):
                 input_seq_time = [each[1] for each in sample[1]]
                 label_seq_time = [each[1] for each in sample[2]]
                 label_seq_cats = [poi_idx2cat_idx_dict[each] for each in label_seq]
-                input_seq_embed = torch.stack(input_traj_to_embeddings(sample, poi_embeddings))
-                batch_seq_embeds.append(input_seq_embed)
+                
+                # 调用修改后的函数,返回embeddings和时间序列
+                input_seq_embed, seq_times = input_traj_to_embeddings(sample, poi_embeddings)
+                batch_seq_embeds.append(torch.stack(input_seq_embed))
+                batch_seq_times.append(seq_times)
                 batch_seq_lens.append(len(input_seq))
                 batch_input_seqs.append(input_seq)
                 batch_seq_labels_poi.append(torch.LongTensor(label_seq))
                 batch_seq_labels_time.append(torch.FloatTensor(label_seq_time))
                 batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
+                
+                # 构建目标时间(训练时=标签时间)
+                batch_target_times.append(torch.FloatTensor(label_seq_time))
 
             # Pad seqs for batch training
             batch_padded = pad_sequence(batch_seq_embeds, batch_first=True, padding_value=-1)
             label_padded_poi = pad_sequence(batch_seq_labels_poi, batch_first=True, padding_value=-1)
             label_padded_time = pad_sequence(batch_seq_labels_time, batch_first=True, padding_value=-1)
             label_padded_cat = pad_sequence(batch_seq_labels_cat, batch_first=True, padding_value=-1)
+            
+            # Pad时间序列
+            padded_seq_times = pad_sequence(batch_seq_times, batch_first=True, padding_value=0)
+            padded_target_times = pad_sequence(batch_target_times, batch_first=True, padding_value=0)
 
             # Feedforward
             x = batch_padded.to(device=args.device, dtype=torch.float)
+            # TemporalRotaryTransformerModel expects (seq_len, batch, d_model)
+            x = x.transpose(0, 1)  # (batch, seq_len, d_model) -> (seq_len, batch, d_model)
+            
+            # Generate mask based on actual sequence length
+            seq_len = x.size(0)
+            src_mask = seq_model.generate_square_subsequent_mask(seq_len).to(args.device)
+            
             y_poi = label_padded_poi.to(device=args.device, dtype=torch.long)
             y_time = label_padded_time.to(device=args.device, dtype=torch.float)
             y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
-            y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
+            seq_times = padded_seq_times.to(device=args.device)
+            target_times = padded_target_times.to(device=args.device)
+            
+            y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask, seq_times, target_times)
 
             # Graph Attention adjusted prob
             y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi)
@@ -755,7 +822,7 @@ def train(args):
                 'time_embed_state_dict': time_embed_model.state_dict(),
                 'cat_embed_state_dict': cat_embed_model.state_dict(),
                 'embed_fuse1_state_dict': embed_fuse_model1.state_dict(),
-                'embed_fuse2_state_dict': embed_fuse_model2.state_dict(),
+                # 'embed_fuse2_state_dict': embed_fuse_model2.state_dict(),  # 已移除
                 'seq_model_state_dict': seq_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'user_id2idx_dict': user_id2idx_dict,
@@ -797,6 +864,18 @@ def train(args):
                 with open(rf"{model_save_dir}/best_epoch.txt", 'w') as f:
                     print(state_dict['epoch_val_metrics'], file=f)
                 max_val_score = monitor_score
+                best_epoch = epoch
+                patience_counter = 0  # 重置计数器
+                logging.info(f'>>> 新的最佳验证分数: {max_val_score:.4f} @ Epoch {epoch}')
+            else:
+                patience_counter += 1
+                logging.info(f'>>> 验证分数未提升，patience: {patience_counter}/{patience}')
+                
+                # Early stopping 检查
+                if patience_counter >= patience:
+                    logging.info(f'>>> Early Stopping! 最佳epoch: {best_epoch}, 最佳分数: {max_val_score:.4f}')
+                    logging.info(f'>>> 验证集已经{patience}个epoch没有提升，停止训练')
+                    break
 
         # Save train/val metrics for plotting purpose
         with open(os.path.join(args.save_dir, 'metrics-train.txt'), "w") as f:

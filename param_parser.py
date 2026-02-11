@@ -76,16 +76,16 @@ def parameter_parser():
                         help='Num of TransformerEncoderLayer')
     parser.add_argument('--transformer-nhead',
                         type=int,
-                        default=2,
+                        default=4,
                         help='Num of heads in multiheadattention')
     parser.add_argument('--transformer-dropout',
                         type=float,
-                        default=0.3,
+                        default=0.4,
                         help='Dropout rate for transformer')
     parser.add_argument('--time-embed-dim',
                         type=int,
-                        default=32,
-                        help='Time embedding dimensions')
+                        default=128,  # 从32增大到128,匹配user+poi维度的一半用于旋转
+                        help='Time embedding dimensions for rotation')
     parser.add_argument('--cat-embed-dim',
                         type=int,
                         default=32,
@@ -98,6 +98,14 @@ def parameter_parser():
                         type=int,
                         default=128,
                         help='Node attn map hidden dimensions')
+    parser.add_argument('--temporal-rotation-theta',
+                        type=float,
+                        default=10000.0,
+                        help='Base frequency for temporal rotary encoding')
+    parser.add_argument('--target-time-embed-dim',
+                        type=int,
+                        default=128,
+                        help='Target time embedding dimension for cross-attention decoder')
 
     # Training hyper-parameters
     parser.add_argument('--batch',
@@ -118,7 +126,7 @@ def parameter_parser():
                         help='Learning rate scheduler factor')
     parser.add_argument('--weight_decay',
                         type=float,
-                        default=5e-4,
+                        default=7e-4,
                         help='Weight decay (L2 loss on parameters).')
 
     # Experiment config
