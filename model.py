@@ -38,15 +38,24 @@ class NodeAttnMap(nn.Module):
 
 
 class GraphConvolution(nn.Module):
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, bias=True, use_gat=False, gat_lambda=0.7, dropout=0.3):
         super(GraphConvolution, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.use_gat = use_gat
+        self.gat_lambda = gat_lambda
+        self.dropout = dropout
+        
         self.weight = Parameter(torch.FloatTensor(in_features, out_features))
         if bias:
             self.bias = Parameter(torch.FloatTensor(out_features))
         else:
             self.register_parameter('bias', None)
+        
+        if use_gat:
+            self.attn_weight = Parameter(torch.FloatTensor(2 * out_features, 1))
+            nn.init.xavier_uniform_(self.attn_weight.data, gain=1.414)
+        
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -57,7 +66,60 @@ class GraphConvolution(nn.Module):
 
     def forward(self, input, adj):
         support = torch.mm(input, self.weight)
-        output = torch.spmm(adj, support)
+        
+        if self.use_gat:
+            # GAT path: compute attention only for edges (sparse version)
+            if adj.is_sparse:
+                adj_dense = adj.to_dense()
+            else:
+                adj_dense = adj
+            
+            N = support.size(0)
+            device = support.device
+            
+            # Find edges (nonzero entries in adjacency matrix)
+            edge_indices = torch.nonzero(adj_dense, as_tuple=False)  # [num_edges, 2]
+            num_edges = edge_indices.size(0)
+            
+            if num_edges > 0:
+                # Compute attention scores only for existing edges
+                src_nodes = edge_indices[:, 0]  # source nodes
+                dst_nodes = edge_indices[:, 1]  # destination nodes
+                
+                # Get features for source and destination nodes
+                h_src = support[src_nodes]  # [num_edges, out_features]
+                h_dst = support[dst_nodes]  # [num_edges, out_features]
+                
+                # Concatenate and compute attention
+                combined = torch.cat([h_src, h_dst], dim=1)  # [num_edges, 2*out_features]
+                e = torch.matmul(combined, self.attn_weight).squeeze()  # [num_edges]
+                e = F.leaky_relu(e, 0.2)
+                
+                # Build sparse attention matrix and apply softmax per row
+                attention_gat = torch.zeros_like(adj_dense)
+                attention_gat[src_nodes, dst_nodes] = e
+                
+                # Row-wise softmax (normalize per source node)
+                attention_gat = F.softmax(attention_gat, dim=1)
+                
+                # Dropout
+                attention_gat = F.dropout(attention_gat, self.dropout, training=self.training)
+                
+                # Residual fusion
+                attention_final = self.gat_lambda * adj_dense + (1 - self.gat_lambda) * attention_gat
+            else:
+                # No edges, use original adjacency
+                attention_final = adj_dense
+            
+            # Aggregate neighbor features
+            output = torch.matmul(attention_final, support)
+        else:
+            # GCN path: original logic
+            if adj.is_sparse:
+                output = torch.spmm(adj, support)
+            else:
+                output = torch.mm(adj, support)
+        
         if self.bias is not None:
             return output + self.bias
         else:
@@ -70,7 +132,7 @@ class GraphConvolution(nn.Module):
 
 
 class GCN(nn.Module):
-    def __init__(self, ninput, nhid, noutput, dropout):
+    def __init__(self, ninput, nhid, noutput, dropout, use_gat=False, gat_lambda=0.7):
         super(GCN, self).__init__()
 
         self.gcn = nn.ModuleList()
@@ -79,7 +141,12 @@ class GCN(nn.Module):
 
         channels = [ninput] + nhid + [noutput]
         for i in range(len(channels) - 1):
-            gcn_layer = GraphConvolution(channels[i], channels[i + 1])
+            gcn_layer = GraphConvolution(
+                channels[i], channels[i + 1],
+                use_gat=use_gat,
+                gat_lambda=gat_lambda,
+                dropout=dropout
+            )
             self.gcn.append(gcn_layer)
 
     def forward(self, x, adj):

@@ -98,6 +98,16 @@ def parameter_parser():
                         type=int,
                         default=128,
                         help='Node attn map hidden dimensions')
+    
+    # GAT parameters
+    parser.add_argument('--use-gat',
+                        action='store_true',
+                        default=False,
+                        help='Use GAT instead of GCN')
+    parser.add_argument('--gat-lambda',
+                        type=float,
+                        default=0.7,
+                        help='Residual fusion weight for GAT (range [0,1])')
 
     # Training hyper-parameters
     parser.add_argument('--batch',

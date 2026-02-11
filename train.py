@@ -226,7 +226,9 @@ def train(args):
     poi_embed_model = GCN(ninput=args.gcn_nfeat,
                           nhid=args.gcn_nhid,
                           noutput=args.poi_embed_dim,
-                          dropout=args.gcn_dropout)
+                          dropout=args.gcn_dropout,
+                          use_gat=args.use_gat,
+                          gat_lambda=args.gat_lambda)
 
     # Node Attn Model
     node_attn_model = NodeAttnMap(in_features=X.shape[1], nhid=args.node_attn_nhid, use_mask=False)
