@@ -133,6 +133,34 @@ class FuseEmbeddings(nn.Module):
         return x
 
 
+class GatingNetwork(nn.Module):
+    """门控网络:动态决定图注意力和Transformer预测的融合权重"""
+    def __init__(self, user_embed_dim, poi_embed_dim, time_embed_dim, hidden_dim=64):
+        super(GatingNetwork, self).__init__()
+        input_dim = user_embed_dim + poi_embed_dim + time_embed_dim
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 2),  # 输出2个权重: [α, β]
+            nn.Softmax(dim=-1)  # 归一化,确保权重和为1
+        )
+    
+    def forward(self, user_embed, poi_embed, time_embed):
+        """
+        Args:
+            user_embed: [user_embed_dim]
+            poi_embed: [poi_embed_dim] 
+            time_embed: [time_embed_dim]
+        Returns:
+            weights: [2] - [α, β], α用于图注意力, β用于Transformer
+        """
+        x = torch.cat([user_embed, poi_embed, time_embed], dim=-1)
+        weights = self.mlp(x)
+        return weights
+
+
 def t2v(tau, f, out_features, w, b, w0, b0, arg=None):
     if arg:
         v1 = f(torch.matmul(tau, w) + b, arg)

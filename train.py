@@ -18,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from dataloader import load_graph_adj_mtx, load_graph_node_features
-from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel
+from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel, GatingNetwork
 from param_parser import parameter_parser
 from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_last_timestep, \
     mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss
@@ -255,6 +255,9 @@ def train(args):
                                  args.transformer_nlayers,
                                  dropout=args.transformer_dropout)
 
+    # %% Model7: Gating network for dynamic fusion
+    gating_model = GatingNetwork(args.user_embed_dim, args.poi_embed_dim, args.time_embed_dim)
+
     # Define overall loss and optimizer
     optimizer = optim.Adam(params=list(poi_embed_model.parameters()) +
                                   list(node_attn_model.parameters()) +
@@ -263,7 +266,8 @@ def train(args):
                                   list(cat_embed_model.parameters()) +
                                   list(embed_fuse_model1.parameters()) +
                                   list(embed_fuse_model2.parameters()) +
-                                  list(seq_model.parameters()),
+                                  list(seq_model.parameters()) +
+                                  list(gating_model.parameters()),
                            lr=args.lr,
                            weight_decay=args.weight_decay)
 
@@ -317,14 +321,43 @@ def train(args):
 
         return input_seq_embed
 
-    def adjust_pred_prob_by_graph(y_pred_poi):
+    def adjust_pred_prob_by_graph(y_pred_poi, poi_embeddings):
+        """使用门控网络动态融合图注意力和Transformer预测"""
         y_pred_poi_adjusted = torch.zeros_like(y_pred_poi)
         attn_map = node_attn_model(X, A)
 
         for i in range(len(batch_seq_lens)):
             traj_i_input = batch_input_seqs[i]  # list of input check-in pois
+            traj_i_input_time = batch_input_seqs_time[i]  # list of input times
+            
+            # 获取当前轨迹的用户embedding
+            traj_id = batch[i][0]
+            user_id = traj_id.split('_')[0]
+            user_idx = user_id2idx_dict[user_id]
+            user_embed = user_embed_model(torch.LongTensor([user_idx]).to(device=args.device))
+            user_embed = torch.squeeze(user_embed)
+            
             for j in range(len(traj_i_input)):
-                y_pred_poi_adjusted[i, j, :] = attn_map[traj_i_input[j], :] + y_pred_poi[i, j, :]
+                current_poi_idx = traj_i_input[j]
+                current_time = traj_i_input_time[j]
+                
+                # 获取当前POI的embedding
+                poi_embed = poi_embeddings[current_poi_idx].to(device=args.device)
+                
+                # 获取当前时间的embedding
+                time_embed = time_embed_model(
+                    torch.tensor([current_time], dtype=torch.float).to(device=args.device))
+                time_embed = torch.squeeze(time_embed)
+                
+                # 通过门控网络计算融合权重
+                weights = gating_model(user_embed, poi_embed, time_embed)  # [2]
+                alpha = weights[0]  # 图注意力的权重
+                beta = weights[1]   # Transformer的权重
+                
+                # 动态加权融合
+                graph_score = attn_map[current_poi_idx, :]
+                transformer_score = y_pred_poi[i, j, :]
+                y_pred_poi_adjusted[i, j, :] = alpha * graph_score + beta * transformer_score
 
         return y_pred_poi_adjusted
 
@@ -337,6 +370,7 @@ def train(args):
     embed_fuse_model1 = embed_fuse_model1.to(device=args.device)
     embed_fuse_model2 = embed_fuse_model2.to(device=args.device)
     seq_model = seq_model.to(device=args.device)
+    gating_model = gating_model.to(device=args.device)
 
     # %% Loop epoch
     # For plotting
@@ -373,6 +407,7 @@ def train(args):
         embed_fuse_model1.train()
         embed_fuse_model2.train()
         seq_model.train()
+        gating_model.train()
 
         train_batches_top1_acc_list = []
         train_batches_top5_acc_list = []
@@ -392,6 +427,7 @@ def train(args):
 
             # For padding
             batch_input_seqs = []
+            batch_input_seqs_time = []  # 新增:保存输入序列的时间信息
             batch_seq_lens = []
             batch_seq_embeds = []
             batch_seq_labels_poi = []
@@ -413,6 +449,7 @@ def train(args):
                 batch_seq_embeds.append(input_seq_embed)
                 batch_seq_lens.append(len(input_seq))
                 batch_input_seqs.append(input_seq)
+                batch_input_seqs_time.append(input_seq_time)  # 新增:保存时间信息
                 batch_seq_labels_poi.append(torch.LongTensor(label_seq))
                 batch_seq_labels_time.append(torch.FloatTensor(label_seq_time))
                 batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
@@ -430,8 +467,8 @@ def train(args):
             y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
             y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
 
-            # Graph Attention adjusted prob
-            y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi)
+            # Graph Attention adjusted prob with gating mechanism
+            y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi, poi_embeddings)
 
             loss_poi = criterion_poi(y_pred_poi_adjusted.transpose(1, 2), y_poi)
             loss_time = criterion_time(torch.squeeze(y_pred_time), y_time)
@@ -510,6 +547,7 @@ def train(args):
         embed_fuse_model1.eval()
         embed_fuse_model2.eval()
         seq_model.eval()
+        gating_model.eval()
         val_batches_top1_acc_list = []
         val_batches_top5_acc_list = []
         val_batches_top10_acc_list = []
@@ -527,6 +565,7 @@ def train(args):
 
             # For padding
             batch_input_seqs = []
+            batch_input_seqs_time = []  # 新增:保存输入序列的时间信息
             batch_seq_lens = []
             batch_seq_embeds = []
             batch_seq_labels_poi = []
@@ -547,6 +586,7 @@ def train(args):
                 batch_seq_embeds.append(input_seq_embed)
                 batch_seq_lens.append(len(input_seq))
                 batch_input_seqs.append(input_seq)
+                batch_input_seqs_time.append(input_seq_time)  # 新增:保存时间信息
                 batch_seq_labels_poi.append(torch.LongTensor(label_seq))
                 batch_seq_labels_time.append(torch.FloatTensor(label_seq_time))
                 batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
@@ -564,8 +604,8 @@ def train(args):
             y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
             y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
 
-            # Graph Attention adjusted prob
-            y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi)
+            # Graph Attention adjusted prob with gating mechanism
+            y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi, poi_embeddings)
 
             # Calculate loss
             loss_poi = criterion_poi(y_pred_poi_adjusted.transpose(1, 2), y_poi)
@@ -757,6 +797,7 @@ def train(args):
                 'embed_fuse1_state_dict': embed_fuse_model1.state_dict(),
                 'embed_fuse2_state_dict': embed_fuse_model2.state_dict(),
                 'seq_model_state_dict': seq_model.state_dict(),
+                'gating_model_state_dict': gating_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'user_id2idx_dict': user_id2idx_dict,
                 'poi_id2idx_dict': poi_id2idx_dict,
