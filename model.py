@@ -92,6 +92,233 @@ class GCN(nn.Module):
         return x
 
 
+class TrajectoryAugmentation:
+    """Data augmentation for trajectory sequences (operates on raw data before embedding)"""
+    def __init__(self, mask_ratio=0.15, crop_ratio=0.2, time_noise_std=0.01):
+        self.mask_ratio = mask_ratio
+        self.crop_ratio = crop_ratio
+        self.time_noise_std = time_noise_std
+    
+    def mask_augment(self, sample, mask_token=-1):
+        """Randomly mask POIs in the trajectory"""
+        traj_id, input_seq, label_seq = sample
+        if len(input_seq) == 0:
+            return sample
+        
+        # Create a copy
+        aug_input_seq = list(input_seq)
+        
+        # Randomly select positions to mask
+        num_to_mask = max(1, int(len(aug_input_seq) * self.mask_ratio))
+        mask_indices = torch.randperm(len(aug_input_seq))[:num_to_mask].tolist()
+        
+        # Mask selected positions (replace POI with mask_token, keep time)
+        for idx in mask_indices:
+            poi_id, time_feat = aug_input_seq[idx]
+            aug_input_seq[idx] = (mask_token, time_feat)
+        
+        return (traj_id, aug_input_seq, label_seq)
+    
+    def crop_augment(self, sample):
+        """Randomly crop the trajectory sequence"""
+        traj_id, input_seq, label_seq = sample
+        seq_len = len(input_seq)
+        
+        if seq_len <= 2:
+            return sample
+        
+        # Calculate crop length
+        crop_len = max(2, int(seq_len * (1 - self.crop_ratio)))
+        
+        # Random start position
+        start_idx = torch.randint(0, seq_len - crop_len + 1, (1,)).item()
+        
+        # Crop sequences
+        aug_input_seq = input_seq[start_idx:start_idx + crop_len]
+        aug_label_seq = label_seq[start_idx:start_idx + crop_len]
+        
+        return (traj_id, aug_input_seq, aug_label_seq)
+    
+    def time_noise_augment(self, sample):
+        """Add Gaussian noise to time features"""
+        traj_id, input_seq, label_seq = sample
+        
+        # Add noise to input sequence times
+        aug_input_seq = []
+        for poi_id, time_feat in input_seq:
+            noise = torch.randn(1).item() * self.time_noise_std
+            noisy_time = max(0.0, min(1.0, time_feat + noise))  # Clip to [0, 1]
+            aug_input_seq.append((poi_id, noisy_time))
+        
+        # Add noise to label sequence times
+        aug_label_seq = []
+        for poi_id, time_feat in label_seq:
+            noise = torch.randn(1).item() * self.time_noise_std
+            noisy_time = max(0.0, min(1.0, time_feat + noise))  # Clip to [0, 1]
+            aug_label_seq.append((poi_id, noisy_time))
+        
+        return (traj_id, aug_input_seq, aug_label_seq)
+    
+    def augment(self, sample):
+        """Apply all augmentation methods"""
+        # Apply augmentations sequentially
+        aug_sample = self.crop_augment(sample)
+        aug_sample = self.mask_augment(aug_sample)
+        aug_sample = self.time_noise_augment(aug_sample)
+        return aug_sample
+
+
+class ContrastiveLearning(nn.Module):
+    """Contrastive learning module for POI and trajectory level"""
+    def __init__(self, temperature=0.07, poi_weight=0.5, traj_weight=0.5):
+        super(ContrastiveLearning, self).__init__()
+        self.temperature = temperature
+        self.poi_weight = poi_weight
+        self.traj_weight = traj_weight
+    
+    def info_nce_loss(self, anchor, positive, negatives):
+        """
+        Compute InfoNCE loss
+        anchor: (embed_dim,)
+        positive: (embed_dim,)
+        negatives: (num_negatives, embed_dim)
+        """
+        # Normalize embeddings
+        anchor = F.normalize(anchor, dim=-1)
+        positive = F.normalize(positive, dim=-1)
+        negatives = F.normalize(negatives, dim=-1)
+        
+        # Compute similarities
+        pos_sim = torch.sum(anchor * positive, dim=-1) / self.temperature
+        neg_sim = torch.matmul(negatives, anchor) / self.temperature
+        
+        # InfoNCE loss
+        logits = torch.cat([pos_sim.unsqueeze(0), neg_sim])
+        labels = torch.zeros(1, dtype=torch.long, device=anchor.device)
+        loss = F.cross_entropy(logits.unsqueeze(0), labels)
+        
+        return loss
+    
+    def poi_contrastive_loss(self, poi_embeddings, input_seqs, aug_input_seqs):
+        """
+        POI-level contrastive learning based on co-occurrence
+        poi_embeddings: (num_pois, embed_dim)
+        input_seqs: list of lists of POI indices
+        aug_input_seqs: list of lists of augmented POI indices
+        
+        Strategy: POIs that co-occur in the same trajectory should have similar embeddings
+        """
+        total_loss = 0.0
+        count = 0
+        
+        # Build co-occurrence relationships from trajectories
+        # For each POI, collect its co-occurring POIs (positives) and non-co-occurring POIs (negatives)
+        poi_cooccur = {}  # {poi_idx: set of co-occurring POIs}
+        all_pois = set()
+        
+        # Process original sequences
+        for seq in input_seqs:
+            seq_pois = [p for p in seq if p != -1]
+            all_pois.update(seq_pois)
+            # For each POI in this trajectory, others are its positives
+            for i, poi in enumerate(seq_pois):
+                if poi not in poi_cooccur:
+                    poi_cooccur[poi] = set()
+                # Add other POIs in the same trajectory as co-occurring
+                poi_cooccur[poi].update([p for j, p in enumerate(seq_pois) if j != i])
+        
+        # Process augmented sequences
+        for seq in aug_input_seqs:
+            seq_pois = [p for p in seq if p != -1]
+            all_pois.update(seq_pois)
+            for i, poi in enumerate(seq_pois):
+                if poi not in poi_cooccur:
+                    poi_cooccur[poi] = set()
+                poi_cooccur[poi].update([p for j, p in enumerate(seq_pois) if j != i])
+        
+        all_pois = list(all_pois)
+        
+        if len(all_pois) < 2:
+            return torch.tensor(0.0, device=poi_embeddings.device)
+        
+        # For each POI, compute contrastive loss
+        for poi_idx in all_pois:
+            if poi_idx == -1 or poi_idx not in poi_cooccur:
+                continue
+            
+            positives_set = poi_cooccur[poi_idx]
+            if len(positives_set) == 0:
+                continue
+            
+            # Anchor: current POI embedding
+            anchor = poi_embeddings[poi_idx]
+            
+            # Positives: co-occurring POIs in the same trajectories
+            positive_indices = list(positives_set)
+            
+            # Negatives: POIs that don't co-occur with this POI
+            negative_indices = [p for p in all_pois if p != poi_idx and p not in positives_set and p != -1]
+            
+            if len(negative_indices) == 0:
+                continue
+            
+            # Compute loss for each positive
+            for pos_idx in positive_indices:
+                positive = poi_embeddings[pos_idx]
+                negatives = poi_embeddings[negative_indices]
+                
+                # Compute InfoNCE loss
+                loss = self.info_nce_loss(anchor, positive, negatives)
+                total_loss += loss
+                count += 1
+        
+        return total_loss / count if count > 0 else torch.tensor(0.0, device=poi_embeddings.device)
+    
+    def trajectory_contrastive_loss(self, traj_embeds, aug_traj_embeds):
+        """
+        Trajectory-level contrastive learning
+        traj_embeds: (batch_size, embed_dim) - mean pooled trajectory representations
+        aug_traj_embeds: (batch_size, embed_dim) - augmented trajectory representations
+        """
+        batch_size = traj_embeds.shape[0]
+        
+        if batch_size < 2:
+            return torch.tensor(0.0, device=traj_embeds.device)
+        
+        total_loss = 0.0
+        
+        # For each trajectory in batch
+        for i in range(batch_size):
+            anchor = traj_embeds[i]
+            positive = aug_traj_embeds[i]
+            
+            # Negatives: all other trajectories (original and augmented)
+            neg_indices = [j for j in range(batch_size) if j != i]
+            negatives = torch.cat([traj_embeds[neg_indices], aug_traj_embeds[neg_indices]], dim=0)
+            
+            # Compute loss
+            loss = self.info_nce_loss(anchor, positive, negatives)
+            total_loss += loss
+        
+        return total_loss / batch_size
+    
+    def forward(self, poi_embeddings, input_seqs, aug_input_seqs, 
+                traj_embeds, aug_traj_embeds):
+        """
+        Compute total contrastive loss
+        """
+        # POI-level loss
+        poi_loss = self.poi_contrastive_loss(poi_embeddings, input_seqs, aug_input_seqs)
+        
+        # Trajectory-level loss
+        traj_loss = self.trajectory_contrastive_loss(traj_embeds, aug_traj_embeds)
+        
+        # Combined loss
+        total_loss = self.poi_weight * poi_loss + self.traj_weight * traj_loss
+        
+        return total_loss, poi_loss, traj_loss
+
+
 class UserEmbeddings(nn.Module):
     def __init__(self, num_users, embedding_dim):
         super(UserEmbeddings, self).__init__()

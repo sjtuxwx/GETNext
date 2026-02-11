@@ -18,7 +18,8 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from dataloader import load_graph_adj_mtx, load_graph_node_features
-from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel
+from model import GCN, NodeAttnMap, UserEmbeddings, Time2Vec, CategoryEmbeddings, FuseEmbeddings, TransformerModel, \
+    TrajectoryAugmentation, ContrastiveLearning
 from param_parser import parameter_parser
 from utils import increment_path, calculate_laplacian_matrix, zipdir, top_k_acc_last_timestep, \
     mAP_metric_last_timestep, MRR_metric_last_timestep, maksed_mse_loss
@@ -231,6 +232,10 @@ def train(args):
     # Node Attn Model
     node_attn_model = NodeAttnMap(in_features=X.shape[1], nhid=args.node_attn_nhid, use_mask=False)
 
+    # Learnable MASK embedding for masked POIs
+    mask_poi_embedding = nn.Parameter(torch.randn(args.poi_embed_dim, device=args.device))
+    nn.init.normal_(mask_poi_embedding, mean=0.0, std=0.02)
+
     # %% Model2: User embedding model, nn.embedding
     num_users = len(user_id2idx_dict)
     user_embed_model = UserEmbeddings(num_users, args.user_embed_dim)
@@ -239,7 +244,10 @@ def train(args):
     time_embed_model = Time2Vec('sin', out_dim=args.time_embed_dim)
 
     # %% Model4: Category embedding model
-    cat_embed_model = CategoryEmbeddings(num_cats, args.cat_embed_dim)
+    # Add one extra category for MASK token to avoid conflict with real category 0
+    num_cats_with_mask = num_cats + 1  # +1 for MASK category
+    cat_embed_model = CategoryEmbeddings(num_cats_with_mask, args.cat_embed_dim)
+    MASK_CAT_ID = num_cats  # MASK category ID is the last one
 
     # %% Model5: Embedding fusion models
     embed_fuse_model1 = FuseEmbeddings(args.user_embed_dim, args.poi_embed_dim)
@@ -248,22 +256,43 @@ def train(args):
     # %% Model6: Sequence model
     args.seq_input_embed = args.poi_embed_dim + args.user_embed_dim + args.time_embed_dim + args.cat_embed_dim
     seq_model = TransformerModel(num_pois,
-                                 num_cats,
+                                 num_cats_with_mask,  # Use num_cats_with_mask for category prediction
                                  args.seq_input_embed,
                                  args.transformer_nhead,
                                  args.transformer_nhid,
                                  args.transformer_nlayers,
                                  dropout=args.transformer_dropout)
 
+    # %% Model7: Contrastive learning (if enabled)
+    contrastive_module = None
+    traj_augmentation = None
+    if args.contrastive_loss_weight > 0:
+        traj_augmentation = TrajectoryAugmentation(
+            mask_ratio=args.mask_ratio,
+            crop_ratio=args.aug_crop_ratio,
+            time_noise_std=0.01  # Fixed
+        )
+        contrastive_module = ContrastiveLearning(
+            temperature=args.contrastive_temperature,
+            poi_weight=0.5,  # Fixed
+            traj_weight=0.5  # Fixed
+        )
+
     # Define overall loss and optimizer
-    optimizer = optim.Adam(params=list(poi_embed_model.parameters()) +
-                                  list(node_attn_model.parameters()) +
-                                  list(user_embed_model.parameters()) +
-                                  list(time_embed_model.parameters()) +
-                                  list(cat_embed_model.parameters()) +
-                                  list(embed_fuse_model1.parameters()) +
-                                  list(embed_fuse_model2.parameters()) +
-                                  list(seq_model.parameters()),
+    optimizer_params = (list(poi_embed_model.parameters()) +
+                       list(node_attn_model.parameters()) +
+                       list(user_embed_model.parameters()) +
+                       list(time_embed_model.parameters()) +
+                       list(cat_embed_model.parameters()) +
+                       list(embed_fuse_model1.parameters()) +
+                       list(embed_fuse_model2.parameters()) +
+                       list(seq_model.parameters()) +
+                       [mask_poi_embedding])  # Add learnable MASK embedding
+    
+    if contrastive_module is not None:
+        optimizer_params += list(contrastive_module.parameters())
+    
+    optimizer = optim.Adam(params=optimizer_params,
                            lr=args.lr,
                            weight_decay=args.weight_decay)
 
@@ -280,7 +309,8 @@ def train(args):
         traj_id = sample[0]
         input_seq = [each[0] for each in sample[1]]
         input_seq_time = [each[1] for each in sample[1]]
-        input_seq_cat = [poi_idx2cat_idx_dict[each] for each in input_seq]
+        # Handle mask tokens (-1) by using MASK_CAT_ID instead of 0
+        input_seq_cat = [poi_idx2cat_idx_dict[each] if each != -1 else MASK_CAT_ID for each in input_seq]
 
         # User to embedding
         user_id = traj_id.split('_')[0]
@@ -292,8 +322,12 @@ def train(args):
         # POI to embedding and fuse embeddings
         input_seq_embed = []
         for idx in range(len(input_seq)):
-            poi_embedding = poi_embeddings[input_seq[idx]]
-            poi_embedding = torch.squeeze(poi_embedding).to(device=args.device)
+            # Handle mask token: use learnable MASK embedding instead of zero vector
+            if input_seq[idx] == -1:
+                poi_embedding = mask_poi_embedding  # Use learnable MASK embedding
+            else:
+                poi_embedding = poi_embeddings[input_seq[idx]]
+                poi_embedding = torch.squeeze(poi_embedding).to(device=args.device)
 
             # Time to vector
             time_embedding = time_embed_model(
@@ -337,6 +371,8 @@ def train(args):
     embed_fuse_model1 = embed_fuse_model1.to(device=args.device)
     embed_fuse_model2 = embed_fuse_model2.to(device=args.device)
     seq_model = seq_model.to(device=args.device)
+    if contrastive_module is not None:
+        contrastive_module = contrastive_module.to(device=args.device)
 
     # %% Loop epoch
     # For plotting
@@ -350,6 +386,7 @@ def train(args):
     train_epochs_poi_loss_list = []
     train_epochs_time_loss_list = []
     train_epochs_cat_loss_list = []
+    train_epochs_contrastive_loss_list = []
     val_epochs_top1_acc_list = []
     val_epochs_top5_acc_list = []
     val_epochs_top10_acc_list = []
@@ -373,6 +410,8 @@ def train(args):
         embed_fuse_model1.train()
         embed_fuse_model2.train()
         seq_model.train()
+        if contrastive_module is not None:
+            contrastive_module.train()
 
         train_batches_top1_acc_list = []
         train_batches_top5_acc_list = []
@@ -384,6 +423,7 @@ def train(args):
         train_batches_poi_loss_list = []
         train_batches_time_loss_list = []
         train_batches_cat_loss_list = []
+        train_batches_contrastive_loss_list = []
         src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
         # Loop batch
         for b_idx, batch in enumerate(train_loader):
@@ -437,8 +477,41 @@ def train(args):
             loss_time = criterion_time(torch.squeeze(y_pred_time), y_time)
             loss_cat = criterion_cat(y_pred_cat.transpose(1, 2), y_cat)
 
+            # Contrastive learning loss
+            loss_contrastive = torch.tensor(0.0, device=args.device)
+            if contrastive_module is not None and args.contrastive_loss_weight > 0:
+                # Generate augmented samples
+                aug_batch = [traj_augmentation.augment(sample) for sample in batch]
+                
+                
+                # Get augmented embeddings
+                aug_batch_seq_embeds = []
+                aug_batch_input_seqs = []
+                for aug_sample in aug_batch:
+                    aug_input_seq = [each[0] for each in aug_sample[1]]
+                    aug_input_seq_embed = torch.stack(input_traj_to_embeddings(aug_sample, poi_embeddings))
+                    aug_batch_seq_embeds.append(aug_input_seq_embed)
+                    aug_batch_input_seqs.append(aug_input_seq)
+                
+                # Pad augmented sequences
+                aug_batch_padded = pad_sequence(aug_batch_seq_embeds, batch_first=True, padding_value=-1)
+                aug_x = aug_batch_padded.to(device=args.device, dtype=torch.float)
+                
+                # Get trajectory representations (mean pooling over sequence)
+                traj_repr = torch.stack([x[i, :batch_seq_lens[i], :].mean(dim=0) 
+                                        for i in range(len(batch_seq_lens))])
+                aug_traj_repr = torch.stack([aug_x[i, :len(aug_batch_input_seqs[i]), :].mean(dim=0) 
+                                            for i in range(len(aug_batch_input_seqs))])
+                
+                # Compute contrastive loss
+                loss_contrastive, loss_poi_cl, loss_traj_cl = contrastive_module(
+                    poi_embeddings, batch_input_seqs, aug_batch_input_seqs,
+                    traj_repr, aug_traj_repr
+                )
+
             # Final loss
-            loss = loss_poi + loss_time * args.time_loss_weight + loss_cat
+            loss = loss_poi + loss_time * args.time_loss_weight + loss_cat + \
+                   loss_contrastive * args.contrastive_loss_weight
             optimizer.zero_grad()
             loss.backward(retain_graph=True)
             optimizer.step()
@@ -473,17 +546,21 @@ def train(args):
             train_batches_poi_loss_list.append(loss_poi.detach().cpu().numpy())
             train_batches_time_loss_list.append(loss_time.detach().cpu().numpy())
             train_batches_cat_loss_list.append(loss_cat.detach().cpu().numpy())
+            train_batches_contrastive_loss_list.append(loss_contrastive.detach().cpu().numpy())
 
             # Report training progress
             if (b_idx % (args.batch * 5)) == 0:
                 sample_idx = 0
                 batch_pred_pois_wo_attn = y_pred_poi.detach().cpu().numpy()
+                contrastive_loss_str = f'train_move_contrastive_loss:{np.mean(train_batches_contrastive_loss_list):.4f}\n' \
+                                      if args.contrastive_loss_weight > 0 else ''
                 logging.info(f'Epoch:{epoch}, batch:{b_idx}, '
                              f'train_batch_loss:{loss.item():.2f}, '
                              f'train_batch_top1_acc:{top1_acc / len(batch_label_pois):.2f}, '
                              f'train_move_loss:{np.mean(train_batches_loss_list):.2f}\n'
                              f'train_move_poi_loss:{np.mean(train_batches_poi_loss_list):.2f}\n'
                              f'train_move_time_loss:{np.mean(train_batches_time_loss_list):.2f}\n'
+                             f'{contrastive_loss_str}'
                              f'train_move_top1_acc:{np.mean(train_batches_top1_acc_list):.4f}\n'
                              f'train_move_top5_acc:{np.mean(train_batches_top5_acc_list):.4f}\n'
                              f'train_move_top10_acc:{np.mean(train_batches_top10_acc_list):.4f}\n'
@@ -510,6 +587,8 @@ def train(args):
         embed_fuse_model1.eval()
         embed_fuse_model2.eval()
         seq_model.eval()
+        if contrastive_module is not None:
+            contrastive_module.eval()
         val_batches_top1_acc_list = []
         val_batches_top5_acc_list = []
         val_batches_top10_acc_list = []
@@ -643,6 +722,8 @@ def train(args):
         epoch_train_poi_loss = np.mean(train_batches_poi_loss_list)
         epoch_train_time_loss = np.mean(train_batches_time_loss_list)
         epoch_train_cat_loss = np.mean(train_batches_cat_loss_list)
+        epoch_train_contrastive_loss = np.mean(train_batches_contrastive_loss_list) \
+            if args.contrastive_loss_weight > 0 else 0.0
         epoch_val_top1_acc = np.mean(val_batches_top1_acc_list)
         epoch_val_top5_acc = np.mean(val_batches_top5_acc_list)
         epoch_val_top10_acc = np.mean(val_batches_top10_acc_list)
@@ -659,6 +740,7 @@ def train(args):
         train_epochs_poi_loss_list.append(epoch_train_poi_loss)
         train_epochs_time_loss_list.append(epoch_train_time_loss)
         train_epochs_cat_loss_list.append(epoch_train_cat_loss)
+        train_epochs_contrastive_loss_list.append(epoch_train_contrastive_loss)
         train_epochs_top1_acc_list.append(epoch_train_top1_acc)
         train_epochs_top5_acc_list.append(epoch_train_top5_acc)
         train_epochs_top10_acc_list.append(epoch_train_top10_acc)
@@ -684,11 +766,14 @@ def train(args):
         lr_scheduler.step(monitor_loss)
 
         # Print epoch results
+        contrastive_log = f"train_contrastive_loss:{epoch_train_contrastive_loss:.4f}, " \
+            if args.contrastive_loss_weight > 0 else ""
         logging.info(f"Epoch {epoch}/{args.epochs}\n"
                      f"train_loss:{epoch_train_loss:.4f}, "
                      f"train_poi_loss:{epoch_train_poi_loss:.4f}, "
                      f"train_time_loss:{epoch_train_time_loss:.4f}, "
                      f"train_cat_loss:{epoch_train_cat_loss:.4f}, "
+                     f"{contrastive_log}"
                      f"train_top1_acc:{epoch_train_top1_acc:.4f}, "
                      f"train_top5_acc:{epoch_train_top5_acc:.4f}, "
                      f"train_top10_acc:{epoch_train_top10_acc:.4f}, "
@@ -757,6 +842,7 @@ def train(args):
                 'embed_fuse1_state_dict': embed_fuse_model1.state_dict(),
                 'embed_fuse2_state_dict': embed_fuse_model2.state_dict(),
                 'seq_model_state_dict': seq_model.state_dict(),
+                'contrastive_module_state_dict': contrastive_module.state_dict() if contrastive_module is not None else None,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'user_id2idx_dict': user_id2idx_dict,
                 'poi_id2idx_dict': poi_id2idx_dict,
@@ -769,6 +855,7 @@ def train(args):
                     'epoch_train_poi_loss': epoch_train_poi_loss,
                     'epoch_train_time_loss': epoch_train_time_loss,
                     'epoch_train_cat_loss': epoch_train_cat_loss,
+                    'epoch_train_contrastive_loss': epoch_train_contrastive_loss,
                     'epoch_train_top1_acc': epoch_train_top1_acc,
                     'epoch_train_top5_acc': epoch_train_top5_acc,
                     'epoch_train_top10_acc': epoch_train_top10_acc,
@@ -805,6 +892,8 @@ def train(args):
             print(f'train_epochs_time_loss_list={[float(f"{each:.4f}") for each in train_epochs_time_loss_list]}',
                   file=f)
             print(f'train_epochs_cat_loss_list={[float(f"{each:.4f}") for each in train_epochs_cat_loss_list]}', file=f)
+            if args.contrastive_loss_weight > 0:
+                print(f'train_epochs_contrastive_loss_list={[float(f"{each:.4f}") for each in train_epochs_contrastive_loss_list]}', file=f)
             print(f'train_epochs_top1_acc_list={[float(f"{each:.4f}") for each in train_epochs_top1_acc_list]}', file=f)
             print(f'train_epochs_top5_acc_list={[float(f"{each:.4f}") for each in train_epochs_top5_acc_list]}', file=f)
             print(f'train_epochs_top10_acc_list={[float(f"{each:.4f}") for each in train_epochs_top10_acc_list]}',

@@ -99,6 +99,24 @@ def parameter_parser():
                         default=128,
                         help='Node attn map hidden dimensions')
 
+    # Contrastive learning hyper-parameters
+    parser.add_argument('--contrastive-loss-weight',
+                        type=float,
+                        default=0.0,
+                        help='Contrastive learning loss weight (0 to disable)')
+    parser.add_argument('--contrastive-temperature',
+                        type=float,
+                        default=0.07,
+                        help='Temperature parameter for contrastive learning')
+    parser.add_argument('--mask-ratio',
+                        type=float,
+                        default=0.15,
+                        help='POI masking ratio for data augmentation')
+    parser.add_argument('--aug-crop-ratio',
+                        type=float,
+                        default=0.2,
+                        help='Trajectory cropping ratio for data augmentation')
+
     # Training hyper-parameters
     parser.add_argument('--batch',
                         type=int,
