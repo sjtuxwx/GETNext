@@ -95,12 +95,23 @@ class GraphConvolution(nn.Module):
                 e = torch.matmul(combined, self.attn_weight).squeeze()  # [num_edges]
                 e = F.leaky_relu(e, 0.2)
                 
-                # Build sparse attention matrix and apply softmax per row
-                attention_gat = torch.zeros_like(adj_dense)
-                attention_gat[src_nodes, dst_nodes] = e
+                # Apply softmax per source node (vectorized version)
+                # Create dense matrix for softmax
+                attention_scores = torch.full((N, N), -9e15, device=device)
+                attention_scores[src_nodes, dst_nodes] = e
                 
-                # Row-wise softmax (normalize per source node)
-                attention_gat = F.softmax(attention_gat, dim=1)
+                # Softmax per row (only neighbors will have valid values)
+                attention_gat = F.softmax(attention_scores, dim=1)
+                
+                # Zero out positions that don't have edges (to maintain sparsity after softmax)
+                mask = torch.zeros_like(adj_dense, dtype=torch.bool)
+                mask[src_nodes, dst_nodes] = True
+                attention_gat = attention_gat * mask.float()
+                
+                # Re-normalize to ensure each row sums to 1 (only for rows with neighbors)
+                row_sums = attention_gat.sum(dim=1, keepdim=True)
+                row_sums[row_sums == 0] = 1  # Avoid division by zero
+                attention_gat = attention_gat / row_sums
                 
                 # Dropout
                 attention_gat = F.dropout(attention_gat, self.dropout, training=self.training)

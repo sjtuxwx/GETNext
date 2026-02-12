@@ -9,5 +9,6 @@ CUDA_VISIBLE_DEVICES=2 python train.py --data-train dataset/NYC/NYC_train.csv \
                 --transformer-nlayers 2 --transformer-nhead 2 \
                 --batch 16 --epochs 200 \
                 --use-gat \
+                --lr 0.002 \
                 --gat-lambda 0.7 \
                 --name gat_lambda_0.7
